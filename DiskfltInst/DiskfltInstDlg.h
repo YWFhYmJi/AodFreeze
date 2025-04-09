@@ -42,7 +42,7 @@ public:
 	afx_msg void OnBnClickedExit();
 	afx_msg void OnBnClickedProtectsys();
 	afx_msg void OnSelchangeCommand();
-	BOOL GetConfigFromControls(PDISKFILTER_PROTECTION_CONFIG Config, __int64 *NeedMemory);
+	BOOL GetConfigFromControls(PDISKFILTER_PROTECTION_CONFIG Config, ULONGLONG *NeedMemory);
 	afx_msg void OnBnClickedAdvancedsetting();
 	afx_msg void OnBnClickedCheckupdate();
 };
