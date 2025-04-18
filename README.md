@@ -13,7 +13,7 @@
 V3.3
 - 修复了驱动白名单的BUG
 - 修复了很多BUG
-- 增加了对Windows XP的支持（需要EncodePointer支持，只在XPSP2及以上系统可用）
+- 增加了对Windows XP的支持（需要EncodePointer支持，只在XPSP2及以上系统可用） \
 已知问题
 - ThawSpace在某些旧版系统中FAT32格式不可用，需要重新格式化成NTFS格式
 
