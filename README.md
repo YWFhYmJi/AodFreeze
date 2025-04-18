@@ -1,5 +1,5 @@
 # AodFreeze
-傲盾还原v3.2 修改自 [傲盾还原 By dbgger@gmail.com](https://code.google.com/p/diskflt) \
+傲盾还原v3.3 修改自 [傲盾还原 By dbgger@gmail.com](https://code.google.com/p/diskflt) \
 支持Windows XP SP2及以上版本的32位、64位系统 \
 支持FAT、NTFS文件系统 \
 自动保护MBR、GPT的分区表（保护盘分区表无法修改） \
