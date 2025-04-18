@@ -57,6 +57,22 @@ NTSTATUS IrpCreateFile(
 	IN PVOID EaBuffer OPTIONAL,
 	IN ULONG EaLength);
 
+// 创建或者打开文件（使用磁盘根目录句柄）
+// ZwCreateFile
+NTSTATUS IrpCreateFile(
+	OUT PFILE_OBJECT *ppFileObject,
+	IN ACCESS_MASK DesiredAccess,
+	IN HANDLE hRootFile,
+	IN PUNICODE_STRING pustrFilePath,
+	OUT PIO_STATUS_BLOCK IoStatusBlock,
+	IN PLARGE_INTEGER AllocationSize OPTIONAL,
+	IN ULONG FileAttributes,
+	IN ULONG ShareAccess,
+	IN ULONG CreateDisposition,
+	IN ULONG CreateOptions,
+	IN PVOID EaBuffer OPTIONAL,
+	IN ULONG EaLength);
+
 // 文件遍历
 // ZwQueryDirectoryFile
 NTSTATUS IrpQueryDirectoryFile(

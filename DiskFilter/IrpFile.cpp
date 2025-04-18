@@ -1,3 +1,4 @@
+#include "Pch.h"
 #include "IrpFile.h"
 
 
@@ -46,11 +47,57 @@ NTSTATUS IrpCreateFile(
 	IN ULONG EaLength)
 {
 	NTSTATUS status = STATUS_SUCCESS;
-	ULONG ulFileNameMaxSize = 512;
 	WCHAR wszName[100] = { 0 };
-	UNICODE_STRING ustrRootPath;
+	UNICODE_STRING ustrRootPath, ustrFilePath;
 	OBJECT_ATTRIBUTES objectAttributes = { 0 };
 	HANDLE hRootFile = NULL;
+
+	// 打开磁盘根目录并获取句柄
+	wcscpy(wszName, L"\\??\\A:\\");
+	wszName[4] = pustrFilePath->Buffer[0];
+	RtlInitUnicodeString(&ustrRootPath, wszName);
+	InitializeObjectAttributes(&objectAttributes, &ustrRootPath, OBJ_KERNEL_HANDLE, NULL, NULL);
+	status = IoCreateFile(&hRootFile, GENERIC_READ | SYNCHRONIZE,
+		&objectAttributes, IoStatusBlock, NULL, FILE_ATTRIBUTE_NORMAL,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0, CreateFileTypeNone,
+		NULL, IO_NO_PARAMETER_CHECKING);
+	if (!NT_SUCCESS(status))
+	{
+		LogErr("IoCreateFile Error[0x%X]\n", status);
+		return status;
+	}
+
+	ustrFilePath.Buffer = &pustrFilePath->Buffer[2];
+	ustrFilePath.Length = pustrFilePath->Length - 4;
+	ustrFilePath.MaximumLength = pustrFilePath->MaximumLength - 4;
+	status = IrpCreateFile(ppFileObject, DesiredAccess, hRootFile, &ustrFilePath, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
+	ZwClose(hRootFile);
+
+	return status;
+}
+
+
+// 创建或者打开文件（使用磁盘根目录句柄）
+// ZwCreateFile
+NTSTATUS IrpCreateFile(
+	OUT PFILE_OBJECT *ppFileObject,
+	IN ACCESS_MASK DesiredAccess,
+	IN HANDLE hRootFile,
+	IN PUNICODE_STRING pustrFilePath,
+	OUT PIO_STATUS_BLOCK IoStatusBlock,
+	IN PLARGE_INTEGER AllocationSize OPTIONAL,
+	IN ULONG FileAttributes,
+	IN ULONG ShareAccess,
+	IN ULONG CreateDisposition,
+	IN ULONG CreateOptions,
+	IN PVOID EaBuffer OPTIONAL,
+	IN ULONG EaLength)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	UNICODE_STRING ustrRootPath;
+	OBJECT_ATTRIBUTES objectAttributes = { 0 };
 	PFILE_OBJECT pRootFileObject = NULL, pFileObject = NULL;
 	PDEVICE_OBJECT RootDeviceObject = NULL, RootRealDevice = NULL;
 	PIRP pIrp = NULL;
@@ -60,29 +107,11 @@ NTSTATUS IrpCreateFile(
 	IO_SECURITY_CONTEXT ioSecurityContext = { 0 };
 	PIO_STACK_LOCATION pIoStackLocation = NULL;
 
-	// 打开磁盘根目录并获取句柄
-	wcscpy(wszName, L"\\??\\A:\\");
-	wszName[4] = pustrFilePath->Buffer[0];
-	RtlInitUnicodeString(&ustrRootPath, wszName);
-	DbgPrint("RootPath:%wZ\n", &ustrRootPath);
-	InitializeObjectAttributes(&objectAttributes, &ustrRootPath, OBJ_KERNEL_HANDLE, NULL, NULL);
-	status = IoCreateFile(&hRootFile, GENERIC_READ | SYNCHRONIZE,
-		&objectAttributes, IoStatusBlock, NULL, FILE_ATTRIBUTE_NORMAL,
-		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-		FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0, CreateFileTypeNone,
-		NULL, IO_NO_PARAMETER_CHECKING);
-	if (!NT_SUCCESS(status))
-	{
-		DbgPrint("IoCreateFile Error[0x%X]", status);
-		return status;
-	}
-
 	// 获取磁盘根目录文件对象
 	status = ObReferenceObjectByHandle(hRootFile, FILE_READ_ACCESS, *IoFileObjectType, KernelMode, (PVOID *)&pRootFileObject, NULL);
 	if (!NT_SUCCESS(status))
 	{
-		ZwClose(hRootFile);
-		DbgPrint("ObReferenceObjectByHandle Error[0x%X]\n", status);
+		LogErr("ObReferenceObjectByHandle Error[0x%X]\n", status);
 		return status;
 	}
 
@@ -92,14 +121,13 @@ NTSTATUS IrpCreateFile(
 
 	// 关闭磁盘根目录句柄和对象
 	ObDereferenceObject(pRootFileObject);
-	ZwClose(hRootFile);
 
 	// 创建IRP
 	pIrp = IoAllocateIrp(RootDeviceObject->StackSize, FALSE);
 	if (NULL == pIrp)
 	{
 		ObDereferenceObject(pFileObject);
-		DbgPrint("IoAllocateIrp Error!\n");
+		LogErr("IoAllocateIrp Error!\n");
 		return STATUS_UNSUCCESSFUL;
 	}
 
@@ -111,7 +139,7 @@ NTSTATUS IrpCreateFile(
 	status = ObCreateObject(KernelMode, *IoFileObjectType, &objectAttributes, KernelMode, NULL, sizeof(FILE_OBJECT), 0, 0, (PVOID *)&pFileObject);
 	if (!NT_SUCCESS(status))
 	{
-		DbgPrint("ObCreateObject Error[0x%X]\n", status);
+		LogErr("ObCreateObject Error[0x%X]\n", status);
 		return status;
 	}
 
@@ -123,12 +151,11 @@ NTSTATUS IrpCreateFile(
 	pFileObject->Flags = FO_SYNCHRONOUS_IO;
 
 	// FILE_OBJECT中的FileName最好动态创建, 否则ObDereferenceObject文件句柄的时候会蓝屏
-	pFileObject->FileName.Buffer = (PWCHAR)ExAllocatePool(NonPagedPool, ulFileNameMaxSize);
-	pFileObject->FileName.MaximumLength = (USHORT)ulFileNameMaxSize;
-	pFileObject->FileName.Length = pustrFilePath->Length - 4;
-	RtlZeroMemory(pFileObject->FileName.Buffer, ulFileNameMaxSize);
-	RtlCopyMemory(pFileObject->FileName.Buffer, &pustrFilePath->Buffer[2], pFileObject->FileName.Length);
-	DbgPrint("pFileObject->FileName:%wZ\n", &pFileObject->FileName);
+	pFileObject->FileName.Buffer = (PWCHAR)ExAllocatePool(NonPagedPool, pustrFilePath->MaximumLength);
+	pFileObject->FileName.MaximumLength = (USHORT)pustrFilePath->MaximumLength;
+	pFileObject->FileName.Length = pustrFilePath->Length;
+	RtlZeroMemory(pFileObject->FileName.Buffer, pustrFilePath->MaximumLength);
+	RtlCopyMemory(pFileObject->FileName.Buffer, pustrFilePath->Buffer, pFileObject->FileName.Length);
 	KeInitializeEvent(&pFileObject->Lock, SynchronizationEvent, FALSE);
 	KeInitializeEvent(&pFileObject->Event, NotificationEvent, FALSE);
 
@@ -139,7 +166,7 @@ NTSTATUS IrpCreateFile(
 	{
 		IoFreeIrp(pIrp);
 		ObDereferenceObject(pFileObject);
-		DbgPrint("SeCreateAccessState Error[0x%X]\n", status);
+		LogErr("SeCreateAccessState Error[0x%X]\n", status);
 		return status;
 	}
 
@@ -192,7 +219,7 @@ NTSTATUS IrpCreateFile(
 	if (!NT_SUCCESS(status))
 	{
 		ObDereferenceObject(pFileObject);
-		DbgPrint("IRP FAILED!\n");
+		LogErr("IRP FAILED!\n");
 		return status;
 	}
 
@@ -377,6 +404,7 @@ NTSTATUS IrpSetInformationFile(
 	KEVENT kEvent = { 0 };
 	PIO_STACK_LOCATION pIoStackLocation = NULL;
 	PDEVICE_OBJECT pDevObj = NULL;
+	PSECTION_OBJECT_POINTERS pFileExe = NULL;
 
 	// 判断参数是否有效
 	if ((NULL == pFileObject) ||
@@ -417,6 +445,14 @@ NTSTATUS IrpSetInformationFile(
 
 	// 设置完成实例, 以便通知IRP处理完成, 释放资源
 	IoSetCompletionRoutine(pIrp, MyCompleteRoutine, NULL, TRUE, TRUE, TRUE);
+
+	if (FileInformationClass == FileDispositionInformation && ((PFILE_DISPOSITION_INFORMATION)FileInformation)->DeleteFile == TRUE)
+	{
+		// 删除正在运行中的文件
+		pFileExe = pFileObject->SectionObjectPointer;
+		pFileExe->DataSectionObject = 0;
+		pFileExe->ImageSectionObject = 0;
+	}
 
 	// 发送IRP
 	status = IoCallDriver(pDevObj, pIrp);

@@ -1,3 +1,4 @@
+#include "diskfltlib.h"
 #include "DPBitmap.h"
 #include "Utils.h"
 #include "IrpFile.h"
@@ -8,9 +9,6 @@
 #include <ntdddisk.h>
 #include "messages.h"
 #include "ThawSpace.h"
-
-// 引入函数，用于重启系统
-EXTERN_C NTSTATUS NtShutdownSystem(int Action);
 
 // 引入函数，用于在屏幕上显示文字
 EXTERN_C VOID InbvAcquireDisplayOwnership(VOID);
@@ -38,7 +36,6 @@ typedef struct _VOLUME_INFO
 
 	DWORD		PartitionNumber;	// 分区索引
 	BYTE		PartitionType;		// 分区类型
-	//BOOLEAN		BootIndicator;		// 是否启动分区
 
 	LONGLONG	StartOffset;		// 分区在磁盘里的偏移也就是开始地址
 
@@ -63,13 +60,6 @@ typedef struct _VOLUME_INFO
 	// 扇区重定向表
 	RTL_GENERIC_TABLE	RedirectMap;
 
-} VOLUME_INFO, *PVOLUME_INFO;
-
-// 过滤器设备扩展
-typedef struct _FILTER_DEVICE_EXTENSION
-{
-	// 是否在保护状态
-	BOOLEAN					Protect;
 	//这个卷上的保护系统使用的请求队列
 	LIST_ENTRY				ListHead;
 	//这个卷上的保护系统使用的请求队列的锁
@@ -79,15 +69,15 @@ typedef struct _FILTER_DEVICE_EXTENSION
 	//这个卷上的保护系统使用的请求队列的处理线程之线程句柄
 	PVOID					ReadWriteThread;
 	CLIENT_ID				ReadWriteThreadId;
-
 	//请求队列的处理线程结束标志
 	BOOLEAN					ThreadTerminate;
-} FILTER_DEVICE_EXTENSION, *PFILTER_DEVICE_EXTENSION;
+
+} VOLUME_INFO, *PVOLUME_INFO;
 
 // 保护配置文件路径、文件对象、所在盘符、所在扇区
 UNICODE_STRING ConfigPath;
 PFILE_OBJECT ConfigFileObject;
-WCHAR ConfigVolumeLetter;
+VOLUME_INFO ConfigVolume;
 PRETRIEVAL_POINTERS_BUFFER ConfigVcnPairs;
 
 PDEVICE_OBJECT LowerDeviceObject[256]; // 硬盘的下层设备
@@ -96,9 +86,135 @@ DISKFILTER_PROTECTION_CONFIG Config, NewConfig; // 当前保护配置、新配�
 VOLUME_INFO ProtectVolumeList[256]; // 保护卷列表
 PVOLUME_INFO VolumeList[26]; // 盘符对应的保护卷
 UINT VaildVolumeCount; // 保护卷数量
-BOOLEAN HaveDevice; // 是否创建了设备
-PFILTER_DEVICE_EXTENSION DeviceExtension; // 过滤器设备扩展
+BOOLEAN IsProtect; // 是否在保护状态
 BOOLEAN AllowLoadDriver; // 是否允许加载驱动
+
+// 读写操作线程
+void ThreadReadWrite(PVOID Context);
+
+// 获取卷信息
+NTSTATUS GetVolumeInfo(ULONG DiskNum, DWORD PartitionNum, PVOLUME_INFO info)
+{
+	NTSTATUS status;
+	HANDLE fileHandle;
+	UNICODE_STRING fileName;
+	OBJECT_ATTRIBUTES oa;
+	IO_STATUS_BLOCK IoStatusBlock;
+
+	WCHAR volumeDosName[MAX_PATH];
+
+	RtlZeroMemory(info, sizeof(VOLUME_INFO));
+
+	info->DiskNumber = DiskNum;
+	info->PartitionNumber = PartitionNum;
+
+	swprintf_s(volumeDosName, MAX_PATH, L"\\Device\\Harddisk%d\\Partition%d", DiskNum, PartitionNum);
+
+	RtlInitUnicodeString(&fileName, volumeDosName);
+
+	InitializeObjectAttributes(&oa,
+		&fileName,
+		OBJ_CASE_INSENSITIVE,
+		NULL,
+		NULL);
+
+	status = ZwCreateFile(&fileHandle,
+		GENERIC_ALL | SYNCHRONIZE,
+		&oa,
+		&IoStatusBlock,
+		NULL,
+		0,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		FILE_OPEN,
+		FILE_SYNCHRONOUS_IO_NONALERT,	// 同步读写
+		NULL,
+		0);
+
+	if (NT_SUCCESS(status))
+	{
+		IO_STATUS_BLOCK				ioBlock;
+		FILE_FS_SIZE_INFORMATION	sizeoInfo;
+
+		// 得到此卷的一类型，在物理硬盘的上的偏移等信息
+		// 新版操作系统不支持IOCTL_DISK_GET_PARTITION_INFO，改用IOCTL_DISK_GET_PARTITION_INFO_EX
+		PARTITION_INFORMATION_EX	partitionInfo;
+		status = ZwDeviceIoControlFile(fileHandle,
+			NULL,
+			NULL,
+			NULL,
+			&ioBlock,
+			IOCTL_DISK_GET_PARTITION_INFO_EX,
+			NULL,
+			0,
+			&partitionInfo,
+			sizeof(partitionInfo)
+		);
+
+
+		if (NT_SUCCESS(status))
+		{
+			info->StartOffset = partitionInfo.StartingOffset.QuadPart;
+			info->BytesTotal = partitionInfo.PartitionLength.QuadPart;
+			info->FirstDataSector = 0;
+
+			if (partitionInfo.PartitionStyle == PARTITION_STYLE_MBR)
+			{
+				info->PartitionType = partitionInfo.Mbr.PartitionType;
+
+				// FAT分区，获取LBR, 得到第一个簇的偏移
+				if ((PARTITION_FAT_12 == info->PartitionType) ||
+					(PARTITION_FAT_16 == info->PartitionType) ||
+					(PARTITION_HUGE == info->PartitionType) ||
+					(PARTITION_FAT32 == info->PartitionType) ||
+					(PARTITION_FAT32_XINT13 == info->PartitionType) ||
+					(PARTITION_XINT13 == info->PartitionType))
+				{
+					status = GetFatFirstSectorOffset(fileHandle, &info->FirstDataSector);
+				}
+			}
+			else
+			{
+				// 不知道分区是否是FAT类型的，尝试获取第一个簇的偏移
+				GetFatFirstSectorOffset(fileHandle, &info->FirstDataSector);
+				info->PartitionType = PARTITION_IFS;
+			}
+		}
+		else
+		{
+			LogWarn("Failed to read the volume information, error code=0x%.8X\n", status);
+		}
+		
+		if (!NT_SUCCESS(status))
+		{
+			return status;
+		}
+
+		// 得到簇，扇区等大小
+		status = ZwQueryVolumeInformationFile(fileHandle,
+			&IoStatusBlock,
+			&sizeoInfo,
+			sizeof(sizeoInfo),
+			FileFsSizeInformation);
+
+		if (NT_SUCCESS(status))
+		{
+			info->BytesPerSector = sizeoInfo.BytesPerSector;
+			info->BytesPerCluster = sizeoInfo.BytesPerSector * sizeoInfo.SectorsPerAllocationUnit;
+		}
+		else
+		{
+			LogWarn("Failed to read the volume size, error code=0x%.8X\n", status);
+		}
+
+		ZwClose(fileHandle);
+	}
+	else
+	{
+		LogWarn("Failed to open the volume %wZ, error code = 0x%.8X\n", &fileName, status);
+	}
+
+	return status;
+}
 
 // 读取保护配置
 NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION_CONFIG RetConfig)
@@ -125,17 +241,34 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 		swprintf(TempPath, L"%ls%wZ", prefix, ConfigPath);
 		UNICODE_STRING uniPath;
 		RtlInitUnicodeString(&uniPath, TempPath);
-		if (NT_SUCCESS(GetFileHandleReadOnlyDirect(&ConfigHandle, &uniPath)))
+		if (NT_SUCCESS(GetFileHandleReadOnly(&ConfigHandle, &uniPath)))
 		{
 			if (NT_SUCCESS(ObReferenceObjectByHandle(ConfigHandle, 0, NULL, KernelMode, (PVOID *)&ConfigFile, NULL)))
 			{
 				UNICODE_STRING	uniDosName;
 				// 得到类似C:这样的盘符，为了获取VolumeInfo
-				status = RtlVolumeDeviceToDosName(ConfigFile->DeviceObject, &uniDosName);
-
-				if (NT_SUCCESS(status))
+				if (NT_SUCCESS(IoVolumeDeviceToDosName(ConfigFile->DeviceObject, &uniDosName)))
 				{
-					ConfigVolumeLetter = toupper(*(WCHAR *)uniDosName.Buffer);
+					WCHAR ConfigVolumeLetter = toupper(*(WCHAR *)uniDosName.Buffer);
+					ULONG ConfigDiskNum, ConfigPartNum;
+					if (NT_SUCCESS(GetPartNumFromVolLetter(ConfigVolumeLetter, &ConfigDiskNum, &ConfigPartNum)))
+					{
+						LogInfo("Config volume %c -> (%lu,%lu)\n", ConfigVolumeLetter, ConfigDiskNum, ConfigPartNum);
+						if (NT_SUCCESS(GetVolumeInfo(ConfigDiskNum, ConfigPartNum, &ConfigVolume)))
+						{
+							ConfigVolume.Volume = ConfigVolumeLetter;
+						}
+						else
+						{
+							LogWarn("Failed to get config volume info\n");
+							ConfigVolume.Volume = 0; // 获取失败，标记为无效
+						}
+					}
+					else
+					{
+						LogWarn("Failed to read partition number for config volume %c\n", ConfigVolume.Volume);
+					}
+
 					ExFreePool(uniDosName.Buffer);
 				}
 				ObDereferenceObject(ConfigFile);
@@ -171,7 +304,7 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 	// 保护卷个数无效
 	if (Conf->ProtectVolumeCount > sizeof(Conf->ProtectVolume) / sizeof(Conf->ProtectVolume[0]))
 		return STATUS_UNSUCCESSFUL + 12;
-	
+
 	// 驱动白名单或黑名单个数无效
 	if (Conf->DriverCount > sizeof(Conf->DriverList) / sizeof(Conf->DriverList[0]))
 		return STATUS_UNSUCCESSFUL + 13;
@@ -187,14 +320,10 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 // 写入保护配置
 NTSTATUS WriteProtectionConfig(PDISKFILTER_PROTECTION_CONFIG ConfigData)
 {
-	if (ConfigVolumeLetter < L'A' || ConfigVolumeLetter > L'Z')
+	if (ConfigVolume.Volume == 0 || !ConfigVcnPairs || ConfigVcnPairs->Extents[0].Lcn.QuadPart == -1) // 配置文件不支持压缩
 		return STATUS_UNSUCCESSFUL;
 
-	PVOLUME_INFO ConfigVolume = VolumeList[ConfigVolumeLetter - L'A'];
-	if (!ConfigVolume || !ConfigVcnPairs)
-		return STATUS_UNSUCCESSFUL;
-
-	ULONG sectorsPerCluster = ConfigVolume->BytesPerCluster / ConfigVolume->BytesPerSector;
+	ULONG sectorsPerCluster = ConfigVolume.BytesPerCluster / ConfigVolume.BytesPerSector;
 	NTSTATUS status = STATUS_SUCCESS;
 
 	ULONG	Cls, r;
@@ -209,14 +338,14 @@ NTSTATUS WriteProtectionConfig(PDISKFILTER_PROTECTION_CONFIG ConfigData)
 			CnCount; CnCount--, Cls++, Lcn.QuadPart++)
 		{
 			ULONGLONG	i = 0;
-			ULONGLONG	base = ConfigVolume->FirstDataSector + (Lcn.QuadPart * sectorsPerCluster);
+			ULONGLONG	base = ConfigVolume.FirstDataSector + (Lcn.QuadPart * sectorsPerCluster);
 			for (i = 0; i < sectorsPerCluster; i++)
 			{
-				ULONG CurOffset = SectorOffset * ConfigVolume->BytesPerSector;
+				ULONG CurOffset = SectorOffset * ConfigVolume.BytesPerSector;
 				if (CurOffset > sizeof(DISKFILTER_PROTECTION_CONFIG))
 					continue;
-				ULONGLONG DiskOffset = ConfigVolume->StartOffset + (base + i) * ConfigVolume->BytesPerSector;
-				status = FastFsdRequest(LowerDeviceObject[ConfigVolume->DiskNumber], IRP_MJ_WRITE, DiskOffset, (PUCHAR)ConfigData + CurOffset, min(ConfigVolume->BytesPerSector, sizeof(DISKFILTER_PROTECTION_CONFIG) - CurOffset), TRUE);
+				ULONGLONG DiskOffset = ConfigVolume.StartOffset + (base + i) * ConfigVolume.BytesPerSector;
+				status = FastFsdRequest(LowerDeviceObject[ConfigVolume.DiskNumber], IRP_MJ_WRITE, DiskOffset, (PUCHAR)ConfigData + CurOffset, min(ConfigVolume.BytesPerSector, sizeof(DISKFILTER_PROTECTION_CONFIG) - CurOffset), TRUE);
 				if (!NT_SUCCESS(status))
 					return status;
 				SectorOffset++;
@@ -224,114 +353,6 @@ NTSTATUS WriteProtectionConfig(PDISKFILTER_PROTECTION_CONFIG ConfigData)
 		}
 		PrevVCN = ConfigVcnPairs->Extents[r].NextVcn;
 	}
-	return status;
-}
-
-// 获取卷信息
-NTSTATUS GetVolumeInfo(ULONG DiskNum, DWORD PartitionNum, PVOLUME_INFO info)
-{
-	NTSTATUS status;
-	HANDLE fileHandle;
-	UNICODE_STRING fileName;
-	OBJECT_ATTRIBUTES oa;
-	IO_STATUS_BLOCK IoStatusBlock;
-
-	WCHAR volumeDosName[MAX_PATH];
-
-	RtlZeroMemory(info, sizeof(VOLUME_INFO));
-
-	info->DiskNumber = DiskNum;
-	info->PartitionNumber = PartitionNum;
-
-	swprintf_s(volumeDosName, MAX_PATH, L"\\??\\Harddisk%dPartition%d", DiskNum, PartitionNum);
-
-	RtlInitUnicodeString(&fileName, volumeDosName);
-
-	InitializeObjectAttributes(&oa,
-		&fileName,
-		OBJ_CASE_INSENSITIVE,
-		NULL,
-		NULL);
-
-	status = ZwCreateFile(&fileHandle,
-		GENERIC_ALL | SYNCHRONIZE,
-		&oa,
-		&IoStatusBlock,
-		NULL,
-		0,
-		FILE_SHARE_READ | FILE_SHARE_WRITE,
-		FILE_OPEN,
-		FILE_SYNCHRONOUS_IO_NONALERT,	// 同步读写
-		NULL,
-		0);
-
-	if (NT_SUCCESS(status))
-	{
-		IO_STATUS_BLOCK				ioBlock;
-		PARTITION_INFORMATION_EX	partitionInfo;
-		FILE_FS_SIZE_INFORMATION	sizeoInfo;
-
-		// 得到此卷的一类型，在物理硬盘的上的偏移等信息
-		// 新版操作系统不支持IOCTL_DISK_GET_PARTITION_INFO，改用IOCTL_DISK_GET_PARTITION_INFO_EX
-		status = ZwDeviceIoControlFile(fileHandle,
-			NULL,
-			NULL,
-			NULL,
-			&ioBlock,
-			IOCTL_DISK_GET_PARTITION_INFO_EX,
-			NULL,
-			0,
-			&partitionInfo,
-			sizeof(partitionInfo)
-		);
-
-
-		if (NT_SUCCESS(status))
-		{
-			info->StartOffset = partitionInfo.StartingOffset.QuadPart;
-			info->FirstDataSector = 0;
-
-			if (partitionInfo.PartitionStyle == PARTITION_STYLE_MBR)
-			{
-				info->PartitionType = partitionInfo.Mbr.PartitionType;
-				//info->BootIndicator = partitionInfo.BootIndicator;
-
-				// FAT分区，获取LBR, 得到第一个簇的偏移
-				if ((PARTITION_FAT_12 == info->PartitionType) ||
-					(PARTITION_FAT_16 == info->PartitionType) ||
-					(PARTITION_HUGE == info->PartitionType) ||
-					(PARTITION_FAT32 == info->PartitionType) ||
-					(PARTITION_FAT32_XINT13 == info->PartitionType) ||
-					(PARTITION_XINT13 == info->PartitionType))
-				{
-					status = GetFatFirstSectorOffset(fileHandle, &info->FirstDataSector);
-				}
-			}
-			else
-			{
-				// 不知道分区是否是FAT类型的，尝试获取第一个簇的偏移
-				GetFatFirstSectorOffset(fileHandle, &info->FirstDataSector);
-				info->PartitionType = PARTITION_IFS;
-			}
-		}
-
-		// 得到簇，扇区等大小
-		status = ZwQueryVolumeInformationFile(fileHandle,
-			&IoStatusBlock,
-			&sizeoInfo,
-			sizeof(sizeoInfo),
-			FileFsSizeInformation);
-
-		if (NT_SUCCESS(status))
-		{
-			info->BytesPerSector = sizeoInfo.BytesPerSector;
-			info->BytesPerCluster = sizeoInfo.BytesPerSector * sizeoInfo.SectorsPerAllocationUnit;
-			info->BytesTotal = partitionInfo.PartitionLength.QuadPart;
-		}
-
-		ZwClose(fileHandle);
-	}
-
 	return status;
 }
 
@@ -482,33 +503,34 @@ out:
 }
 
 // 设置文件数据直接读写
-NTSTATUS SetBitmapDirectRWFile(WCHAR volume, PWCHAR path, PDP_BITMAP bitmap1, PDP_BITMAP bitmap2)
+NTSTATUS SetDirectReadWriteFile(PVOLUME_INFO volume, PWCHAR path)
 {
 	NTSTATUS status;
-	BOOLEAN	needClose = FALSE;
 
 	HANDLE fileHandle = (HANDLE)-1;
 
 	ULONG   Cls, r, sectorsPerCluster;
 	LARGE_INTEGER PrevVCN, Lcn;
 	PRETRIEVAL_POINTERS_BUFFER pVcnPairs = NULL;
+	WCHAR tempBuffer[MAX_PATH];
+	UNICODE_STRING target;
 
-	PVOLUME_INFO volumeInfo = VolumeList[volume - L'A'];
-
-	if (volume < L'A' || volume > L'Z' || volumeInfo == NULL)
+	if (volume == NULL)
 		return STATUS_UNSUCCESSFUL;
 
-	sectorsPerCluster = volumeInfo->BytesPerCluster / volumeInfo->BytesPerSector;
-
-	status = GetFileHandleReadOnly(volume, path, &fileHandle, &needClose);
+	swprintf_s(tempBuffer, MAX_PATH, L"\\Device\\Harddisk%d\\Partition%d%ls", volume->DiskNumber, volume->PartitionNumber, path);
+	RtlInitUnicodeString(&target, tempBuffer);
+	status = GetFileHandleReadOnly(&fileHandle, &target);
 	if (!NT_SUCCESS(status))
 	{
 		goto out;
 	}
 
+	sectorsPerCluster = volume->BytesPerCluster / volume->BytesPerSector;
+
 	pVcnPairs = (PRETRIEVAL_POINTERS_BUFFER)GetFileClusterList(fileHandle);
 
-	if (!pVcnPairs)
+	if (!pVcnPairs || pVcnPairs->Extents[0].Lcn.QuadPart == -1) // 不支持被压缩的文件
 	{
 		status = STATUS_UNSUCCESSFUL;
 		goto out;
@@ -520,20 +542,18 @@ NTSTATUS SetBitmapDirectRWFile(WCHAR volume, PWCHAR path, PDP_BITMAP bitmap1, PD
 		ULONG	CnCount;
 		Lcn = pVcnPairs->Extents[r].Lcn;
 		LONGLONG EndLcn = Lcn.QuadPart + pVcnPairs->Extents[r].NextVcn.QuadPart - PrevVCN.QuadPart - 1;
-		LogInfo("Cluster %lld -> %lld (Sector %lld -> %lld) is allowed to direct write.\n", Lcn.QuadPart, EndLcn, volumeInfo->FirstDataSector + Lcn.QuadPart * sectorsPerCluster, volumeInfo->FirstDataSector + EndLcn * sectorsPerCluster);
+		LogInfo("Cluster %lld -> %lld (Sector %lld -> %lld) is allowed to direct write.\n", Lcn.QuadPart, EndLcn, volume->FirstDataSector + Lcn.QuadPart * sectorsPerCluster, volume->FirstDataSector + EndLcn * sectorsPerCluster);
 
 		for (CnCount = (ULONG)(pVcnPairs->Extents[r].NextVcn.QuadPart - PrevVCN.QuadPart);
 			CnCount; CnCount--, Cls++, Lcn.QuadPart++)
 		{
 			ULONGLONG	i = 0;
-			ULONGLONG	base = volumeInfo->FirstDataSector + (Lcn.QuadPart * sectorsPerCluster);
+			ULONGLONG	base = volume->FirstDataSector + (Lcn.QuadPart * sectorsPerCluster);
 			for (i = 0; i < sectorsPerCluster; i++)
 			{
 				// 设置位图
-				if (bitmap1 != NULL)
-					DPBitmap_Set(bitmap1, base + i, TRUE);
-				if (bitmap2 != NULL)
-					DPBitmap_Set(bitmap2, base + i, TRUE);
+				DPBitmap_Set(volume->BitmapAllow, base + i, TRUE);
+				DPBitmap_Set(volume->BitmapUsed, base + i, TRUE);
 			}
 		}
 
@@ -543,16 +563,16 @@ NTSTATUS SetBitmapDirectRWFile(WCHAR volume, PWCHAR path, PDP_BITMAP bitmap1, PD
 	__free(pVcnPairs);
 
 out:
-	if (needClose && ((HANDLE)-1 != fileHandle))
+	if ((HANDLE)-1 != fileHandle)
 		ZwClose(fileHandle);
 
 	if (!NT_SUCCESS(status))
 	{
-		LogWarn("Failed to set direct read/write for file %lc:%ls. Status=0x%.8X\n", volume, path, status);
+		LogWarn("Failed to set direct read/write for file (%d,%d):%ls. Status=0x%.8X\n", volume->DiskNumber, volume->PartitionNumber, path, status);
 	}
 	else
 	{
-		LogInfo("Successfully set direct read/write for file %lc:%ls.\n", volume, path);
+		LogInfo("Successfully set direct read/write for file (%d,%d):%ls.\n", volume->DiskNumber, volume->PartitionNumber, path);
 	}
 	return status;
 }
@@ -563,16 +583,13 @@ void InitVolumeAllowList(PVOLUME_INFO volumeInfo)
 	// 放过这几个文件的直接读写
 
 	// bootstat.dat如果不让写，下次启动会显示非正常启动
-	SetBitmapDirectRWFile(volumeInfo->Volume, L"\\Windows\\bootstat.dat", volumeInfo->BitmapAllow, volumeInfo->BitmapUsed);
+	SetDirectReadWriteFile(volumeInfo, L"\\Windows\\bootstat.dat");
 
 	// 分页文件
-	SetBitmapDirectRWFile(volumeInfo->Volume, L"\\pagefile.sys", volumeInfo->BitmapAllow, volumeInfo->BitmapUsed);
+	SetDirectReadWriteFile(volumeInfo, L"\\pagefile.sys");
 
 	// 交换文件
-	SetBitmapDirectRWFile(volumeInfo->Volume, L"\\swapfile.sys", volumeInfo->BitmapAllow, volumeInfo->BitmapUsed);
-
-	// 休眠文件
-	//SetBitmapDirectRWFile(volumeInfo->Volume, L"\\hiberfil.sys", volumeInfo->BitmapAllow, volumeInfo->BitmapUsed);
+	SetDirectReadWriteFile(volumeInfo, L"\\swapfile.sys");
 
 	// 解冻空间
 	if (Config.ProtectionFlags & PROTECTION_ENABLE_THAWSPACE)
@@ -581,7 +598,7 @@ void InitVolumeAllowList(PVOLUME_INFO volumeInfo)
 		{
 			if (!(Config.ThawSpacePath[i][MAX_PATH] & DISKFILTER_THAWSPACE_HIDE) && toupper(Config.ThawSpacePath[i][0]) == volumeInfo->Volume)
 			{
-				if (!NT_SUCCESS(SetBitmapDirectRWFile(volumeInfo->Volume, Config.ThawSpacePath[i] + 2, volumeInfo->BitmapAllow, volumeInfo->BitmapUsed)))
+				if (!NT_SUCCESS(SetDirectReadWriteFile(volumeInfo, Config.ThawSpacePath[i] + 2)))
 				{
 					LogErrorMessageWithString(FilterDevice, MSG_THAWSPACE_LOAD_FAILED, Config.ThawSpacePath[i], wcslen(Config.ThawSpacePath[i]));
 				}
@@ -659,13 +676,76 @@ void InitProtectVolumes()
 			{
 				LogInfo("Successfully get volume logic bitmap\n");
 				// 只有在成功获取位图之后，才认为这个卷有效
-				VaildVolumeCount = Cur + 1;
+
+				//初始化这个卷的请求处理队列
+				InitializeListHead(&ProtectVolumeList[Cur].ListHead);
+				//初始化请求处理队列的锁
+				KeInitializeSpinLock(&ProtectVolumeList[Cur].ListLock);
+				//初始化请求处理队列的同步事件
+				KeInitializeEvent(
+					&ProtectVolumeList[Cur].RequestEvent,
+					SynchronizationEvent,
+					FALSE
+				);
+				//初始化终止处理线程标志
+				ProtectVolumeList[Cur].ThreadTerminate = FALSE;
+				//建立用来处理这个卷的请求的处理线程，线程函数的参数则是指向卷信息的指针
+				HANDLE ThreadHandle = NULL;
+				NTSTATUS status = PsCreateSystemThread(
+					&ThreadHandle,
+					(ACCESS_MASK)0L,
+					NULL,
+					NULL,
+					&ProtectVolumeList[Cur].ReadWriteThreadId,
+					ThreadReadWrite,
+					&ProtectVolumeList[Cur]
+				);
+				if (NT_SUCCESS(status))
+				{
+					//获取处理线程的对象
+					status = ObReferenceObjectByHandle(
+						ThreadHandle,
+						THREAD_ALL_ACCESS,
+						NULL,
+						KernelMode,
+						&ProtectVolumeList[Cur].ReadWriteThread,
+						NULL
+					);
+
+					if (NULL != ThreadHandle)
+						ZwClose(ThreadHandle);
+
+					if (NT_SUCCESS(status))
+					{
+						VaildVolumeCount = Cur + 1;
+					}
+					else
+					{
+						ProtectVolumeList[Cur].ThreadTerminate = TRUE;
+						KeSetEvent(
+							&ProtectVolumeList[Cur].RequestEvent,
+							(KPRIORITY)0,
+							FALSE
+						);
+						LogErr("Failed to get thread handle\n");
+						WCHAR strMsg[512];
+						swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
+						LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
+					}
+				}
+				else
+				{
+					LogInfo("Failed to create handler thread\n");
+					WCHAR strMsg[512];
+					swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
+					LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
+				}
 			}
 			else
 			{
 				LogInfo("Failed to get volume logic bitmap\n");
 				WCHAR strMsg[512];
-				swprintf_s(strMsg, L"(%hu,%hu)", DiskNum, PartitionNum);
+				swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
 				LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
 			}
 		}
@@ -679,7 +759,7 @@ void InitProtectVolumes()
 void StartProtect()
 {
 	LogInfo("Starting protect\n");
-	InterlockedExchange8((PCHAR)&DeviceExtension->Protect, TRUE);
+	InterlockedExchange8((PCHAR)&IsProtect, TRUE);
 }
 
 // 挂载解冻空间
@@ -840,7 +920,7 @@ void CheckThawSpace()
 								FileEndOfFileInformation
 							);
 
-							LogInfo("ThawSpace %wZ: File not found, initializing disk file.\n", file_name);
+							LogInfo("ThawSpace %wZ: File not found, initializing disk file.\n", &file_name);
 							CHAR Buf[256];
 							strcpy(Buf, "Initializing ThawSpace volume ?\n");
 							*strchr(Buf, '?') = (UCHAR)(((USHORT)Config.ThawSpacePath[i][MAX_PATH]) & ~DISKFILTER_THAWSPACE_HIDE);
@@ -858,12 +938,18 @@ void CheckThawSpace()
 		}
 
 		if (ConfigChanged)
+		{
 			WriteProtectionConfig(&Config);
+			RtlCopyMemory(&NewConfig, &Config, sizeof(Config));
+		}
 
 		if (FileChanged)
 		{
 			InbvDisplayString("Initialization finished.\n");
-			NtShutdownSystem(1);
+			if (*NtBuildNumber <= 3790) // 直接重新启动会在Windows XP上提示未正常关闭，删除bootstat.dat文件后再重新启动
+				SafeReboot();
+			else
+				NtShutdownSystem(1);
 		}
 	}
 }
@@ -877,13 +963,15 @@ NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 	PRETRIEVAL_POINTERS_BUFFER	pVcnPairs = NULL;
 	PVOLUME_INFO	volumeInfo = NULL;
 	ULONG	sectorsPerCluster;
+	UNICODE_STRING filePathNew = { 0 };
 
 	BOOLEAN	IsCreditable = FALSE;
 
-	status = GetFileHandleReadOnlyDirect(&fileHandle, filePath);
+	status = GetFileHandleReadOnly(&fileHandle, filePath);
 
 	if (!NT_SUCCESS(status))
 	{
+		LogWarn("Failed to open file: %wZ, error code 0x%.8X\n", filePath, status);
 		goto out;
 	}
 
@@ -891,6 +979,7 @@ NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 
 	if (!NT_SUCCESS(status))
 	{
+		LogWarn("Failed to get file object for file: %wZ, error code 0x%.8X\n", filePath, status);
 		goto out;
 	}
 
@@ -898,27 +987,94 @@ NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 	{
 		UNICODE_STRING	uniDosName;
 		// 得到类似C:这样的盘符，为了获取VolumeInfo
-		status = RtlVolumeDeviceToDosName(fileObject->DeviceObject, &uniDosName);
+		status = IoVolumeDeviceToDosName(fileObject->DeviceObject, &uniDosName);
 
 		if (NT_SUCCESS(status))
 		{
 			volumeInfo = VolumeList[toupper(*(WCHAR *)uniDosName.Buffer) - L'A'];
 			ExFreePool(uniDosName.Buffer);
 		}
+		else
+		{
+			LogWarn("Failed to read volume letter for file: %wZ\n", filePath);
+		}
 	}
+	ObDereferenceObject(fileObject);
 
 	if (!volumeInfo)
 	{
+		LogWarn("Failed to get the volume information for file: %wZ\n", filePath);
 		goto out;
 	}
 
 	sectorsPerCluster = volumeInfo->BytesPerCluster / volumeInfo->BytesPerSector;
 	
 	pVcnPairs = (PRETRIEVAL_POINTERS_BUFFER)GetFileClusterList(fileHandle);
+	ZwClose(fileHandle);
 
 	if (NULL == pVcnPairs)
 	{
+		LogWarn("Failed to get the cluster list for file: %wZ\n", filePath);
 		goto out;
+	}
+	
+	if (pVcnPairs->Extents[0].Lcn.QuadPart == -1) // 最新版win11上的驱动都被压缩了，需要打开文件的压缩数据
+	{
+		LogInfo("Compressed file: %wZ, trying to get WofCompressedData\n", filePath);
+		__free(pVcnPairs);
+		fileHandle = (HANDLE)-1;
+		WCHAR append[] = L":WofCompressedData:$DATA";
+		if (NT_SUCCESS(RtlAllocateUnicodeString(&filePathNew, filePath->Length + sizeof(append))))
+		{
+			if (NT_SUCCESS(RtlAppendUnicodeStringToString(&filePathNew, filePath)) &&
+				NT_SUCCESS(RtlAppendUnicodeToString(&filePathNew, append))
+				)
+			{
+				AdjustPrivilege(SE_BACKUP_PRIVILEGE, TRUE);
+				OBJECT_ATTRIBUTES oa;
+				IO_STATUS_BLOCK IoStatusBlock;
+
+				InitializeObjectAttributes(&oa,
+					&filePathNew,
+					OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+					NULL,
+					NULL);
+
+				status = ZwCreateFile(&fileHandle,
+					FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+					&oa,
+					&IoStatusBlock,
+					NULL,
+					FILE_ATTRIBUTE_NORMAL,
+					FILE_SHARE_READ,
+					FILE_OPEN,
+					FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT,
+					NULL,
+					0);
+
+				if (!NT_SUCCESS(status))
+				{
+					LogWarn("Failed to open file: %wZ, error code 0x%.8X\n", &filePathNew, status);
+					goto out;
+				}
+			}
+		}
+		else
+		{
+			filePathNew.Buffer = NULL;
+		}
+		if (fileHandle == (HANDLE)-1)
+		{
+			LogWarn("Compressed file: %wZ, failed to get WofCompressedData\n", filePath);
+			goto out;
+		}
+		pVcnPairs = (PRETRIEVAL_POINTERS_BUFFER)GetFileClusterList(fileHandle);
+		ZwClose(fileHandle);
+		if (NULL == pVcnPairs)
+		{
+			LogWarn("Failed to get the cluster list for file: %wZ\n", filePath);
+			goto out;
+		}
 	}
 
 	ULONG	Cls, r;
@@ -938,6 +1094,7 @@ NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 				// 此扇区被重定向了, 不可信文件, 终止认证
 				if (base + i >= volumeInfo->SectorCount || DPBitmap_Test(volumeInfo->BitmapRedirect, base + i))
 				{
+					LogInfo("File %wZ sector %llu has been redirected\n", filePath, base + i);
 					goto __exit;
 				}
 			}
@@ -953,12 +1110,8 @@ __exit:
 	__free(pVcnPairs);
 
 out:
-
-	if (fileObject)
-		ObDereferenceObject(fileObject);
-
-	if (((HANDLE)-1 != fileHandle))
-		ZwClose(fileHandle);
+	if (filePathNew.Buffer != NULL)
+		__free(filePathNew.Buffer);
 
 	return IsCreditable ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
@@ -1159,9 +1312,9 @@ NTSTATUS HandleDiskRequest(
 void ThreadReadWrite(PVOID Context)
 {
 	//NTSTATUS类型的函数返回值
-	NTSTATUS					status = STATUS_SUCCESS;
+	NTSTATUS			status = STATUS_SUCCESS;
 	//用来指向过滤设备的设备扩展的指针
-	PFILTER_DEVICE_EXTENSION	device_extension = (PFILTER_DEVICE_EXTENSION)Context;
+	PVOLUME_INFO		volume_info = (PVOLUME_INFO)Context;
 	//请求队列的入口
 	PLIST_ENTRY			ReqEntry = NULL;
 	//irp指针
@@ -1186,26 +1339,24 @@ void ThreadReadWrite(PVOID Context)
 	{
 		//先等待请求队列同步事件，如果队列中没有irp需要处理，我们的线程就等待在这里，让出cpu时间给其它线程
 		KeWaitForSingleObject(
-			&device_extension->RequestEvent,
+			&volume_info->RequestEvent,
 			Executive,
 			KernelMode,
 			FALSE,
 			NULL
 		);
 		//如果有了线程结束标志，那么就在线程内部自己结束自己
-		if (device_extension->ThreadTerminate)
+		if (volume_info->ThreadTerminate)
 		{
 			PsTerminateSystemThread(STATUS_SUCCESS);
 			return;
 		}
 		//从请求队列的首部拿出一个请求来准备处理，这里使用了自旋锁机制，所以不会有冲突
 		while (ReqEntry = ExInterlockedRemoveHeadList(
-			&device_extension->ListHead,
-			&device_extension->ListLock
+			&volume_info->ListHead,
+			&volume_info->ListLock
 		))
 		{
-			PVOLUME_INFO	volumeInfo;
-
 			void * newbuff = NULL;
 
 			//从队列的入口里找到实际的irp的地址
@@ -1213,9 +1364,6 @@ void ThreadReadWrite(PVOID Context)
 
 			//取得irp stack
 			io_stack = IoGetCurrentIrpStackLocation(Irp);
-
-			// 获取卷信息
-			volumeInfo = &ProtectVolumeList[(ULONG_PTR)Irp->IoStatus.Pointer];
 
 			if (IRP_MJ_READ == io_stack->MajorFunction)
 			{
@@ -1247,7 +1395,7 @@ void ThreadReadWrite(PVOID Context)
 			}
 
 			// 得到在卷中的偏移 磁盘偏移-卷逻辑偏移
-			cacheOffset.QuadPart = offset.QuadPart - volumeInfo->StartOffset;
+			cacheOffset.QuadPart = offset.QuadPart - volume_info->StartOffset;
 
 			if (Irp->MdlAddress)
 			{
@@ -1276,14 +1424,14 @@ void ThreadReadWrite(PVOID Context)
 			{
 				if (IRP_MJ_READ == io_stack->MajorFunction)
 				{
-					status = HandleDiskRequest(volumeInfo, io_stack->MajorFunction, cacheOffset.QuadPart,
+					status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
 						newbuff, length);
 					RtlCopyMemory(buffer, newbuff, length);
 				}
 				else
 				{
 					RtlCopyMemory(newbuff, buffer, length);
-					status = HandleDiskRequest(volumeInfo, io_stack->MajorFunction, cacheOffset.QuadPart,
+					status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
 						newbuff, length);
 				}
 				__free(newbuff);
@@ -1309,26 +1457,27 @@ void ThreadReadWrite(PVOID Context)
 		// 处理请求失败，将请求直接交给下层设备处理
 		__failed:
 			IoSkipCurrentIrpStackLocation(Irp);
-			IoCallDriver(LowerDeviceObject[volumeInfo->DiskNumber], Irp);
+			IoCallDriver(LowerDeviceObject[volume_info->DiskNumber], Irp);
 			continue;
 		}
 	}
 }
 
 // 处理IRP_MJ_READ和IRP_MJ_WRITE
-extern "C" BOOLEAN on_diskperf_read_write(
-	IN PUNICODE_STRING physics_device_name,
-	IN ULONG	device_type,
-	IN ULONG device_number,
-	IN ULONG partition_number,
-	IN PDEVICE_OBJECT device_object,
+BOOLEAN
+OnDiskFilterReadWrite(
+	IN PUNICODE_STRING PhysicalDeviceName,
+	IN ULONG DeviceType,
+	IN ULONG DeviceNumber,
+	IN ULONG PartitionNumber,
+	IN PDEVICE_OBJECT DeviceObject,
 	IN PIRP Irp,
-	IN NTSTATUS *status)
+	IN NTSTATUS *Status)
 {
-	UNREFERENCED_PARAMETER(physics_device_name);
-	UNREFERENCED_PARAMETER(device_type);
-	UNREFERENCED_PARAMETER(device_object);
-	UNREFERENCED_PARAMETER(partition_number);
+	UNREFERENCED_PARAMETER(PhysicalDeviceName);
+	UNREFERENCED_PARAMETER(DeviceType);
+	UNREFERENCED_PARAMETER(PartitionNumber);
+	UNREFERENCED_PARAMETER(DeviceObject);
 	PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
 
 	//irp中的数据长度
@@ -1336,23 +1485,10 @@ extern "C" BOOLEAN on_diskperf_read_write(
 	//irp要处理的偏移量
 	LARGE_INTEGER		offset = { 0 };
 
-	if (!HaveDevice)
+	if (!IsProtect)
 	{
 		return FALSE;
 	}
-
-	if (!DeviceExtension->Protect)
-	{
-		return FALSE;
-	}
-
-	// 此段代码在win10上会引发严重的文件系统错误，目前暂时不知道原因
-	/*if (PsGetCurrentThreadId() == DeviceExtension->ReadWriteThreadId.UniqueThread)
-	{
-		if (IRP_MJ_WRITE == irpStack->MajorFunction)
-			LogInfo("Is current thread, passed write request down: offset=%lld, length=%ld\n", irpStack->Parameters.Write.ByteOffset.QuadPart, irpStack->Parameters.Write.Length);
-		return FALSE;
-	}*/
 
 	if (IRP_MJ_WRITE == irpStack->MajorFunction)
 	{
@@ -1372,14 +1508,13 @@ extern "C" BOOLEAN on_diskperf_read_write(
 	for (UINT i = 0; i < VaildVolumeCount; i++)
 	{
 		// 卷是否在受保护的硬盘上
-		if (ProtectVolumeList[i].DiskNumber != device_number)
+		if (ProtectVolumeList[i].DiskNumber != DeviceNumber)
 			continue;
 
 		// 保护MBR及GPT分区表
 		if (IRP_MJ_WRITE == irpStack->MajorFunction && offset.QuadPart < 34 * 512)
 		{
-			*status = STATUS_ACCESS_DENIED;
-			Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+			*Status = Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
 			IoCompleteRequest(Irp, IO_NO_INCREMENT);
 			return TRUE;
 		}
@@ -1392,22 +1527,19 @@ extern "C" BOOLEAN on_diskperf_read_write(
 			//我们首先把这个irp设为pending状态
 			IoMarkIrpPending(Irp);
 
-			// 用IRP中的IoStatus.Pointer传递卷的序号, 反正现在这个参数用不着
-			Irp->IoStatus.Pointer = (PVOID)i;
-
 			//然后将这个irp放进相应的请求队列里
 			ExInterlockedInsertTailList(
-				&DeviceExtension->ListHead,
+				&ProtectVolumeList[i].ListHead,
 				&Irp->Tail.Overlay.ListEntry,
-				&DeviceExtension->ListLock
+				&ProtectVolumeList[i].ListLock
 			);
 			//设置队列的等待事件，通知队列对这个irp进行处理
 			KeSetEvent(
-				&DeviceExtension->RequestEvent,
+				&ProtectVolumeList[i].RequestEvent,
 				(KPRIORITY)0,
 				FALSE);
 			//返回pending状态，这个irp就算处理完了
-			*status = STATUS_PENDING;
+			*Status = STATUS_PENDING;
 
 			// TRUE表始IPR被拦截
 			return TRUE;
@@ -1416,32 +1548,28 @@ extern "C" BOOLEAN on_diskperf_read_write(
 
 	//这个卷不在保护状态，直接交给下层设备进行处理
 	//if (IRP_MJ_WRITE == irpStack->MajorFunction)
-	//	LogInfo("Not protect area, passed write request down: offset=%lld, length=%ld\n", irpStack->Parameters.Write.ByteOffset.QuadPart, irpStack->Parameters.Write.Length);
+	//	LogInfo("Disk %lu not protect area, passed write request down: offset=%lld, length=%ld\n", DeviceNumber, irpStack->Parameters.Write.ByteOffset.QuadPart, irpStack->Parameters.Write.Length);
 
 	return FALSE;
 }
 
 // 处理IRP_MJ_DEVICE_CONTROL
-extern "C" BOOLEAN on_diskperf_device_control(
-	IN PUNICODE_STRING physics_device_name,
-	IN ULONG	device_type,
-	IN ULONG device_number,
-	IN ULONG partition_number,
-	IN PDEVICE_OBJECT device_object,
+BOOLEAN
+OnDiskFilterDeviceControl(
+	IN PUNICODE_STRING PhysicalDeviceName,
+	IN ULONG DeviceType,
+	IN ULONG DeviceNumber,
+	IN ULONG PartitionNumber,
+	IN PDEVICE_OBJECT DeviceObject,
 	IN PIRP Irp,
-	IN NTSTATUS *status)
+	IN NTSTATUS *Status)
 {
-	UNREFERENCED_PARAMETER(device_type);
-	UNREFERENCED_PARAMETER(device_object);
+	UNREFERENCED_PARAMETER(DeviceType);
+	UNREFERENCED_PARAMETER(DeviceObject);
 	PIO_STACK_LOCATION StackLocation = IoGetCurrentIrpStackLocation(Irp);
 	ULONG ControlCode = StackLocation->Parameters.DeviceIoControl.IoControlCode;
 
-	if (!HaveDevice)
-	{
-		return FALSE;
-	}
-
-	if (!DeviceExtension->Protect)
+	if (!IsProtect)
 	{
 		return FALSE;
 	}
@@ -1449,7 +1577,7 @@ extern "C" BOOLEAN on_diskperf_device_control(
 	BOOL flag = FALSE;
 	for (UINT i = 0; i < VaildVolumeCount; i++)
 	{
-		if (ProtectVolumeList[i].DiskNumber == device_number)
+		if (ProtectVolumeList[i].DiskNumber == DeviceNumber)
 		{
 			flag = TRUE;
 			break;
@@ -1465,9 +1593,9 @@ extern "C" BOOLEAN on_diskperf_device_control(
 	// 防止通过发送SCSI指令绕过还原
 	case IOCTL_SCSI_PASS_THROUGH:
 	case IOCTL_SCSI_PASS_THROUGH_DIRECT:
-		*status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+		*Status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		LogInfo("Denied SCSI passthrough request to %wZ on disk %d partition %d\n", physics_device_name, device_number, partition_number);
+		LogInfo("Denied SCSI passthrough request to %wZ on disk %d partition %d\n", PhysicalDeviceName, DeviceNumber, PartitionNumber);
 		return TRUE;
 	// 防止修改分区表
 	case IOCTL_DISK_SET_DRIVE_LAYOUT:
@@ -1476,9 +1604,9 @@ extern "C" BOOLEAN on_diskperf_device_control(
 	case IOCTL_DISK_SET_PARTITION_INFO:
 	case IOCTL_DISK_SET_PARTITION_INFO_EX:
 	case IOCTL_DISK_GROW_PARTITION:
-		*status = Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+		*Status = Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		LogInfo("Denied set partition information request to %wZ on disk %d partition %d\n", physics_device_name, device_number, partition_number);
+		LogInfo("Denied set partition information request to %wZ on disk %d partition %d\n", PhysicalDeviceName, DeviceNumber, PartitionNumber);
 		return TRUE;
 	// 防止格式化硬盘
 	case IOCTL_DISK_COPY_DATA:
@@ -1489,9 +1617,9 @@ extern "C" BOOLEAN on_diskperf_device_control(
 	case IOCTL_DISK_REASSIGN_BLOCKS_EX:
 	case IOCTL_STORAGE_FIRMWARE_DOWNLOAD:
 	case IOCTL_STORAGE_PROTOCOL_COMMAND:
-		*status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+		*Status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		LogInfo("Denied IOCTL 0x%.8X request to %wZ on disk %d partition %d\n", ControlCode, physics_device_name, device_number, partition_number);
+		LogInfo("Denied IOCTL 0x%.8X request to %wZ on disk %d partition %d\n", ControlCode, PhysicalDeviceName, DeviceNumber, PartitionNumber);
 		return TRUE;
 	default:
 		break;
@@ -1501,14 +1629,15 @@ extern "C" BOOLEAN on_diskperf_device_control(
 }
 
 // 处理对过滤器设备的IRP
-extern "C" BOOLEAN on_diskperf_dispatch(
-	PDEVICE_OBJECT dev,
+BOOLEAN
+OnDiskFilterDispatchControl(
+	PDEVICE_OBJECT DeviceObject,
 	PIRP Irp,
-	NTSTATUS *status)
+	NTSTATUS *Status)
 {
-	UNREFERENCED_PARAMETER(dev);
+	UNREFERENCED_PARAMETER(DeviceObject);
 	PIO_STACK_LOCATION StackLocation = IoGetCurrentIrpStackLocation(Irp);
-	*status = STATUS_SUCCESS;
+	*Status = STATUS_SUCCESS;
 	ULONG info = 0;
 	if (StackLocation->MajorFunction == IRP_MJ_DEVICE_CONTROL)
 	{
@@ -1528,7 +1657,7 @@ extern "C" BOOLEAN on_diskperf_dispatch(
 				{
 					if (Data->ControlCode == DISKFILTER_CONTROL_TEST)
 					{
-						*status = STATUS_SUCCESS;
+						*Status = STATUS_SUCCESS;
 						break;
 					}
 					Data->Password[sizeof(Data->Password) - 1] = L'\0';
@@ -1537,7 +1666,7 @@ extern "C" BOOLEAN on_diskperf_dispatch(
 					SHA256(Data->Password, wcslen(Data->Password) * sizeof(WCHAR), Password);
 					if (!RtlEqualMemory(Password, Config.Password, 32))
 					{
-						*status = STATUS_ACCESS_DENIED;
+						*Status = STATUS_ACCESS_DENIED;
 						LogErrorMessageWithString(FilterDevice, MSG_FAILED_LOGIN_ATTEMPT, Data->Password, wcslen(Data->Password));
 						break;
 					}
@@ -1548,39 +1677,39 @@ extern "C" BOOLEAN on_diskperf_dispatch(
 						{
 							RtlCopyMemory(SystemBuffer, &NewConfig, sizeof(NewConfig));
 							info = sizeof(NewConfig);
-							*status = STATUS_SUCCESS;
+							*Status = STATUS_SUCCESS;
 						}
 						else
 						{
-							*status = STATUS_BUFFER_TOO_SMALL;
+							*Status = STATUS_BUFFER_TOO_SMALL;
 						}
 						break;
 					case DISKFILTER_CONTROL_SETCONFIG:
 						RtlCopyMemory(&NewConfig, &Data->Config, sizeof(NewConfig));
-						*status = WriteProtectionConfig(&NewConfig);
+						*Status = WriteProtectionConfig(&NewConfig);
 						break;
 					case DISKFILTER_CONTROL_GETSTATUS:
 						if (OutBufferLength >= sizeof(DISKFILTER_STATUS))
 						{
 							DISKFILTER_STATUS CurStatus;
 							CurStatus.AllowDriverLoad = AllowLoadDriver;
-							CurStatus.ProtectEnabled = DeviceExtension->Protect;
+							CurStatus.ProtectEnabled = IsProtect;
 							RtlCopyMemory(SystemBuffer, &CurStatus, sizeof(CurStatus));
 							info = sizeof(CurStatus);
-							*status = STATUS_SUCCESS;
+							*Status = STATUS_SUCCESS;
 						}
 						else
 						{
-							*status = STATUS_BUFFER_TOO_SMALL;
+							*Status = STATUS_BUFFER_TOO_SMALL;
 						}
 						break;
 					case DISKFILTER_CONTROL_ALLOW_DRIVER_LOAD:
 						InterlockedExchange8((PCHAR)&AllowLoadDriver, TRUE);
-						*status = STATUS_SUCCESS;
+						*Status = STATUS_SUCCESS;
 						break;
 					case DISKFILTER_CONTROL_DENY_DRIVER_LOAD:
 						InterlockedExchange8((PCHAR)&AllowLoadDriver, FALSE);
-						*status = STATUS_SUCCESS;
+						*Status = STATUS_SUCCESS;
 						break;
 					default:
 						break;
@@ -1591,7 +1720,7 @@ extern "C" BOOLEAN on_diskperf_dispatch(
 			break;
 		}
 	}
-	Irp->IoStatus.Status = *status;
+	Irp->IoStatus.Status = *Status;
 	Irp->IoStatus.Information = info;
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 	return TRUE;
@@ -1674,7 +1803,8 @@ void LoadDriverNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_IN
 }
 
 // 卸载驱动时被调用，驱动只有在遇到错误时才可以被卸载
-extern "C" void on_diskperf_driver_unload(PDRIVER_OBJECT DriverObject)
+VOID
+OnDiskFilterUnload(PDRIVER_OBJECT DriverObject)
 {
 	UNICODE_STRING dosDeviceName;
 
@@ -1696,79 +1826,18 @@ void DriverReinit(PDRIVER_OBJECT DriverObject, PVOID Context, ULONG Count)
 	UNREFERENCED_PARAMETER(Context);
 	UNREFERENCED_PARAMETER(Count);
 	NTSTATUS status;
-	HANDLE ThreadHandle = NULL;
 
 	status = ReadProtectionConfig(&ConfigPath, &Config);
 	if (!NT_SUCCESS(status))
 	{
-		LogErr("Failed to read protection config file (%wZ) ! status=0x%.8X\n", ConfigPath, status);
+		LogErr("Failed to read protection config file (%wZ) ! status=0x%.8X\n", &ConfigPath, status);
 		LogErrorMessageWithString(FilterDevice, MSG_FAILED_TO_LOAD_CONFIG, ConfigPath.Buffer, ConfigPath.Length);
-		DriverObject->DriverUnload = on_diskperf_driver_unload;
+		DriverObject->DriverUnload = OnDiskFilterUnload;
 		return;
 	}
 	RtlCopyMemory(&NewConfig, &Config, sizeof(Config));
 
 	CheckThawSpace();
-
-	//初始化这个卷的请求处理队列
-	InitializeListHead(&DeviceExtension->ListHead);
-	//初始化请求处理队列的锁
-	KeInitializeSpinLock(&DeviceExtension->ListLock);
-	//初始化请求处理队列的同步事件
-	KeInitializeEvent(
-		&DeviceExtension->RequestEvent,
-		SynchronizationEvent,
-		FALSE
-	);
-
-	//初始化终止处理线程标志
-	DeviceExtension->ThreadTerminate = FALSE;
-	//建立用来处理这个卷的请求的处理线程，线程函数的参数则是设备扩展
-	status = PsCreateSystemThread(
-		&ThreadHandle,
-		(ACCESS_MASK)0L,
-		NULL,
-		NULL,
-		&DeviceExtension->ReadWriteThreadId,
-		ThreadReadWrite,
-		DeviceExtension
-	);
-
-	if (!NT_SUCCESS(status))
-	{
-		LogErr("Failed to create handler thread! status=0x%.8X\n", status);
-		LogErrorMessage(FilterDevice, MSG_FAILED_TO_INIT);
-		DriverObject->DriverUnload = on_diskperf_driver_unload;
-		return;
-	}
-
-	//获取处理线程的对象
-	status = ObReferenceObjectByHandle(
-		ThreadHandle,
-		THREAD_ALL_ACCESS,
-		NULL,
-		KernelMode,
-		&DeviceExtension->ReadWriteThread,
-		NULL
-	);
-
-	if (NULL != ThreadHandle)
-		ZwClose(ThreadHandle);
-
-	if (!NT_SUCCESS(status))
-	{
-		DeviceExtension->ThreadTerminate = TRUE;
-		KeSetEvent(
-			&DeviceExtension->RequestEvent,
-			(KPRIORITY)0,
-			FALSE
-		);
-
-		LogErr("Failed to get thread handle! status=0x%.8X\n", status);
-		LogErrorMessage(FilterDevice, MSG_FAILED_TO_INIT);
-		DriverObject->DriverUnload = on_diskperf_driver_unload;
-		return;
-	}
 
 	if (Config.ProtectionFlags & PROTECTION_ENABLE)
 	{
@@ -1819,25 +1888,25 @@ void DriverReinit(PDRIVER_OBJECT DriverObject, PVOID Context, ULONG Count)
 	LogErrorMessage(FilterDevice, MSG_INIT_SUCCESS);
 }
 
-extern "C" PDEVICE_OBJECT on_diskperf_driver_entry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING RegistryPath)
+PDEVICE_OBJECT
+OnDiskFilterInitialization(
+	PDRIVER_OBJECT DriverObject,
+	PUNICODE_STRING RegistryPath
+)
 {
 	UNREFERENCED_PARAMETER(RegistryPath);
 	NTSTATUS			status;
 	PDEVICE_OBJECT		deviceObject = NULL;
 	UNICODE_STRING		ntDeviceName;
-	PFILTER_DEVICE_EXTENSION	deviceExtension;
 	UNICODE_STRING		dosDeviceName;
 
 	LogInfo("Driver loaded\n");
-
-	HaveDevice = FALSE;
-	DeviceExtension = NULL;
 
 	RtlInitUnicodeString(&ntDeviceName, DISKFILTER_DEVICE_NAME_W);
 
 	status = IoCreateDevice(
 		DriverObject,
-		sizeof(FILTER_DEVICE_EXTENSION),		// DeviceExtensionSize
+		0,								// DeviceExtensionSize
 		&ntDeviceName,					// DeviceName
 		FILE_DEVICE_DISKFLT,			// DeviceType
 		0,								// DeviceCharacteristics
@@ -1850,8 +1919,6 @@ extern "C" PDEVICE_OBJECT on_diskperf_driver_entry(IN PDRIVER_OBJECT DriverObjec
 		LogErr("IoCreateDevice failed. status = 0x%.8X\n", status);
 		goto failed;
 	}
-
-	deviceExtension = (PFILTER_DEVICE_EXTENSION)deviceObject->DeviceExtension;
 
 	RtlInitUnicodeString(&dosDeviceName, DISKFILTER_DOS_DEVICE_NAME_W);
 
@@ -1866,7 +1933,6 @@ extern "C" PDEVICE_OBJECT on_diskperf_driver_entry(IN PDRIVER_OBJECT DriverObjec
 	mempool_init();
 
 	FilterDevice = NULL;
-	DeviceExtension = NULL;
 	VaildVolumeCount = 0;
 	ConfigFileObject = NULL;
 	memset(LowerDeviceObject, 0, sizeof(LowerDeviceObject));
@@ -1875,15 +1941,18 @@ extern "C" PDEVICE_OBJECT on_diskperf_driver_entry(IN PDRIVER_OBJECT DriverObjec
 	memset(ProtectVolumeList, 0, sizeof(ProtectVolumeList));
 	memset(VolumeList, 0, sizeof(VolumeList));
 	VaildVolumeCount = 0;
-	ConfigVolumeLetter = 0;
+	memset(&ConfigVolume, 0, sizeof(ConfigVolume));
 	ConfigVcnPairs = NULL;
+	IsProtect = FALSE;
+	AllowLoadDriver = TRUE;
 
 	WCHAR strAppend[] = L"\\Parameters";
-	PWCHAR strRegPath = (PWCHAR)__malloc(RegistryPath->Length + (wcslen(strAppend) + 10) * sizeof(WCHAR));
+	ULONG TotalLen = RegistryPath->Length / 2 + wcslen(strAppend) + 10;
+	PWCHAR strRegPath = (PWCHAR)__malloc(TotalLen * sizeof(WCHAR));
 	if (strRegPath)
 	{
 		UNICODE_STRING uniRegPath;
-		swprintf(strRegPath, L"%wZ%ls", RegistryPath, strAppend);
+		swprintf_s(strRegPath, TotalLen, L"%wZ%ls", RegistryPath, strAppend);
 		RtlInitUnicodeString(&uniRegPath, strRegPath);
 		ULONG NeedSize = 0;
 		status = ReadRegString(&uniRegPath, L"ConfigPath", NULL, 0, &NeedSize);
@@ -1913,13 +1982,6 @@ extern "C" PDEVICE_OBJECT on_diskperf_driver_entry(IN PDRIVER_OBJECT DriverObjec
 		goto failed;
 	}
 
-	HaveDevice = TRUE;
-
-	deviceExtension->Protect = FALSE;
-	AllowLoadDriver = TRUE;
-
-	DeviceExtension = deviceExtension;
-
 	FilterDevice = deviceObject;
 
 	IoRegisterBootDriverReinitialization(DriverObject, DriverReinit, NULL);
@@ -1928,7 +1990,7 @@ extern "C" PDEVICE_OBJECT on_diskperf_driver_entry(IN PDRIVER_OBJECT DriverObjec
 		return deviceObject;
 
 failed:
-	DriverObject->DriverUnload = on_diskperf_driver_unload;
+	DriverObject->DriverUnload = OnDiskFilterUnload;
 	IoDeleteSymbolicLink(&dosDeviceName);
 
 	if (deviceObject)
@@ -1937,27 +1999,30 @@ failed:
 }
 
 // 发现硬盘设备时被调用
-extern "C" void on_diskperf_new_disk(
-	IN PDEVICE_OBJECT device_object,
-	IN PUNICODE_STRING physics_device_name,
-	IN ULONG device_type,
-	IN ULONG disk_number,
-	IN ULONG partition_number)
+VOID
+OnDiskFilterNewDisk(
+	IN PDEVICE_OBJECT DeviceObject,
+	IN PUNICODE_STRING PhysicalDeviceName,
+	IN ULONG DeviceType,
+	IN ULONG DeviceNumber,
+	IN ULONG PartitionNumber
+)
 {
 	// 保存设备
-	if (disk_number < sizeof(LowerDeviceObject) / sizeof(*LowerDeviceObject))
+	if (DeviceNumber < sizeof(LowerDeviceObject) / sizeof(*LowerDeviceObject))
 	{
-		LowerDeviceObject[disk_number] = device_object;
+		LowerDeviceObject[DeviceNumber] = DeviceObject;
 	}
-	LogInfo("New disk found: %wZ type is %d on disk %d partition %d\n", physics_device_name, device_type, disk_number, partition_number);
+	LogInfo("New disk found: %wZ type is %d on disk %d partition %d\n", PhysicalDeviceName, DeviceType, DeviceNumber, PartitionNumber);
 }
 
 // 设备被移除时调用
-extern "C" void on_diskperf_remove_disk(
-	IN PDEVICE_OBJECT device_object,
-	IN PUNICODE_STRING physics_device_name
+VOID
+OnDiskFilterRemoveDisk(
+	IN PDEVICE_OBJECT DeviceObject,
+	IN PUNICODE_STRING PhysicalDeviceName
 )
 {
-	UNREFERENCED_PARAMETER(device_object);
-	LogInfo("Disk %wZ removed\n", physics_device_name);
+	UNREFERENCED_PARAMETER(DeviceObject);
+	LogInfo("Disk %wZ removed\n", PhysicalDeviceName);
 }

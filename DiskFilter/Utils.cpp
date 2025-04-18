@@ -5,96 +5,8 @@
 #include <ntdddisk.h>
 #include <ntddvol.h>
 #include "messages.h"
-
-extern "C" PSHORT NtBuildNumber;
-
-#pragma pack(push, 1)
-typedef struct _MFT_SEGMENT_REFERENCE {
-	ULONG  SegmentNumberLowPart;
-	USHORT SegmentNumberHighPart;
-	USHORT SequenceNumber;
-} MFT_SEGMENT_REFERENCE, *PMFT_SEGMENT_REFERENCE;
-
-typedef MFT_SEGMENT_REFERENCE FILE_REFERENCE, *PFILE_REFERENCE;
-
-typedef struct _MULTI_SECTOR_HEADER {
-	UCHAR  Signature[4];
-	USHORT UpdateSequenceArrayOffset;
-	USHORT UpdateSequenceArraySize;
-} MULTI_SECTOR_HEADER, *PMULTI_SECTOR_HEADER;
-
-typedef struct _FILE_RECORD_SEGMENT_HEADER {
-	MULTI_SECTOR_HEADER   MultiSectorHeader;
-	ULONGLONG             Reserved1;
-	USHORT                SequenceNumber;
-	USHORT                Reserved2;
-	USHORT                FirstAttributeOffset;
-	USHORT                Flags;
-	ULONG                 Reserved3[2];
-	FILE_REFERENCE        BaseFileRecordSegment;
-	USHORT                Reserved4;
-	//UPDATE_SEQUENCE_ARRAY UpdateSequenceArray;
-} FILE_RECORD_SEGMENT_HEADER, *PFILE_RECORD_SEGMENT_HEADER;
-
-typedef enum _ATTRIBUTE_TYPE_CODE {
-	ATTR_STANDARD_INFORMATION = 0x10,
-	ATTR_ATTRIBUTE_LIST = 0x20,
-	ATTR_FILE_NAME = 0x30,
-	ATTR_OBJECT_ID = 0x40,
-	ATTR_VOLUME_NAME = 0x60,
-	ATTR_VOLUME_INFORMATION = 0x70,
-	ATTR_DATA = 0x80,
-	ATTR_INDEX_ROOT = 0x90,
-	ATTR_INDEX_ALLOCATION = 0xA0,
-	ATTR_BITMAP = 0xB0,
-	ATTR_REPARSE_POINT = 0xC0,
-	ATTR_END = 0xFFFFFFFF
-} ATTRIBUTE_TYPE_CODE;
-
-#define RESIDENT_FORM 0x00
-#define NONRESIDENT_FORM 0x01
-
-typedef ULONGLONG VCN;
-
-#define FILE_NAME_INDEX_PRESENT 0x10000000
-
-typedef struct _ATTRIBUTE_RECORD_HEADER {
-	ATTRIBUTE_TYPE_CODE TypeCode;
-	ULONG               RecordLength;
-	UCHAR               FormCode;
-	UCHAR               NameLength;
-	USHORT              NameOffset;
-	USHORT              Flags;
-	USHORT              Instance;
-	union {
-		struct {
-			ULONG  ValueLength;
-			USHORT ValueOffset;
-			UCHAR  Reserved[2];
-		} Resident;
-		struct {
-			VCN      LowestVcn;
-			VCN      HighestVcn;
-			USHORT   MappingPairsOffset;
-			UCHAR    Reserved[6];
-			LONGLONG AllocatedLength;
-			LONGLONG FileSize;
-			LONGLONG ValidDataLength;
-			LONGLONG TotalAllocated;
-		} Nonresident;
-	} Form;
-} ATTRIBUTE_RECORD_HEADER, *PATTRIBUTE_RECORD_HEADER;
-
-typedef struct _FILE_NAME_ATTRIBUTE {
-	FILE_REFERENCE ParentDirectory;
-	UCHAR          Reserved[0x30];
-	ULONG          FileAttributes;
-	ULONG          AlignmentOrReserved;
-	UCHAR          FileNameLength;
-	UCHAR          Flags;
-	WCHAR          FileName[1];
-} FILE_NAME_ATTRIBUTE, *PFILE_NAME_ATTRIBUTE;
-#pragma pack(pop)
+#include <stdarg.h>
+#include "IrpFile.h"
 
 NTSTATUS KSleep(ULONG microSecond)
 {
@@ -275,7 +187,7 @@ NTSTATUS RtlAllocateUnicodeString(PUNICODE_STRING us, ULONG maxLength)
 	return status;
 }
 
-NTSTATUS GetFileHandleReadOnlyDirect(PHANDLE fileHandle, PUNICODE_STRING fileName)
+NTSTATUS GetFileHandleReadOnly(PHANDLE fileHandle, PUNICODE_STRING fileName)
 {
 	OBJECT_ATTRIBUTES oa;
 	IO_STATUS_BLOCK IoStatusBlock;
@@ -333,172 +245,6 @@ PVOID GetSystemInfo(SYSTEM_INFORMATION_CLASS InfoClass)
 	return Info;
 }
 
-HANDLE SearchFileHandle(PUNICODE_STRING fileName)
-{
-	NTSTATUS status;
-	ULONG i;
-	PVOID sysBuffer;
-	PSYSTEM_HANDLE_INFORMATION pProcesses;
-	POBJECT_NAME_INFORMATION ObjectName;
-
-	char ObjectNameBuf[1024];
-	ULONG ReturnLen;
-	HANDLE hPageFile;
-
-	ObjectName = (POBJECT_NAME_INFORMATION)ObjectNameBuf;
-	ObjectName->Name.MaximumLength = 510;
-
-	sysBuffer = GetSystemInfo(SystemHandleInformation);
-
-	if (sysBuffer == NULL)
-	{
-		return (HANDLE)-1;
-	}
-
-	pProcesses = (PSYSTEM_HANDLE_INFORMATION)sysBuffer;
-	for (i = 0; i < pProcesses->NumberOfHandles; i++)
-	{
-
-		if (pProcesses->Handles[i].ProcessId == (ULONG64)PsGetCurrentProcessId())
-		{
-			status = ZwQueryObject((HANDLE)pProcesses->Handles[i].Handle, (OBJECT_INFORMATION_CLASS)1,
-				ObjectName, sizeof(ObjectNameBuf), &ReturnLen);
-			if (NT_SUCCESS(status) && (RtlEqualUnicodeString(&ObjectName->Name, fileName, TRUE) == TRUE))
-			{
-				hPageFile = (HANDLE)pProcesses->Handles[i].Handle;
-				__free(sysBuffer);
-				return hPageFile;
-			}
-		}
-	}
-
-	__free(sysBuffer);
-
-	return (HANDLE)-1;
-}
-
-NTSTATUS GetFileHandleReadOnly(WCHAR volume, PWCHAR path, PHANDLE fileHandle, PBOOLEAN needClose)
-{
-	NTSTATUS status;
-	//PEPROCESS eProcess = NULL;
-	WCHAR tempBuffer[MAX_PATH];
-	UNICODE_STRING symbol;
-	UNICODE_STRING target;
-	BOOLEAN	needFree = FALSE;
-	OBJECT_ATTRIBUTES oa;
-	HANDLE linkHandle = NULL;
-	HANDLE linkHandle1 = NULL;
-	ULONG ret;
-
-	if (!fileHandle || !needClose)
-		return STATUS_UNSUCCESSFUL;
-
-	//status = PsLookupProcessByProcessId(PsGetCurrentProcessId(), &eProcess);
-	//if (!NT_SUCCESS(status))
-	//	return status;
-
-	//ObDereferenceObject(eProcess);
-	// 注意，要切入到系统进程获取句柄
-	//KeAttachProcess(eProcess);
-
-	swprintf_s(tempBuffer, MAX_PATH, L"\\??\\%c:%ls", volume, path);
-
-	RtlInitUnicodeString(&target, tempBuffer);
-
-	status = GetFileHandleReadOnlyDirect(fileHandle, &target);
-	if (NT_SUCCESS(status))
-	{
-		*needClose = TRUE;
-	}
-	// 访问拒绝，尝试从HANDLE表中获取
-	else if (status == STATUS_SHARING_VIOLATION)
-	{
-		swprintf(tempBuffer, L"\\??\\%c:", volume);
-		RtlInitUnicodeString(&symbol, tempBuffer);
-		RtlAllocateUnicodeString(&target, 1024);
-
-		needFree = TRUE;
-
-		InitializeObjectAttributes(&oa,
-			&symbol,
-			OBJ_CASE_INSENSITIVE,
-			NULL,
-			NULL);
-
-		// 将\\??\\C:映射为真实路径\\Device\\HarddiskVolume1 这样的路径
-
-		status = ZwOpenSymbolicLinkObject(&linkHandle, GENERIC_READ, &oa);
-
-		if (!NT_SUCCESS(status))
-		{
-			goto out;
-		}
-
-		status = ZwQuerySymbolicLinkObject(linkHandle, &target, &ret);
-
-		if (!NT_SUCCESS(status))
-		{
-			goto out;
-		}
-
-		while (1)
-		{
-			// 看是否查询出来的路径指向的还是symbolicLink
-			InitializeObjectAttributes(&oa,
-				&target,
-				OBJ_CASE_INSENSITIVE,
-				NULL,
-				NULL);
-
-			// 将\\??\\C:映射为真实路径\\Device\\HarddiskVolume1 这样的路径
-
-			status = ZwOpenSymbolicLinkObject(&linkHandle1, GENERIC_READ, &oa);
-
-			if (NT_SUCCESS(status))
-			{
-				ZwClose(linkHandle);
-				linkHandle = linkHandle1;
-				status = ZwQuerySymbolicLinkObject(linkHandle, &target, &ret);
-				if (!NT_SUCCESS(status))
-				{
-					goto out;
-				}
-			}
-			else
-			{
-				break;
-			}
-		}
-
-		// 合并路径
-
-		RtlAppendUnicodeToString(&target, path);
-
-		*fileHandle = SearchFileHandle(&target);
-		status = STATUS_SUCCESS;
-
-		needClose = FALSE;
-	}
-
-	if ((HANDLE)-1 == *fileHandle)
-	{
-		status = STATUS_UNSUCCESSFUL;
-		goto out;
-	}
-
-out:
-	if (linkHandle)
-		ZwClose(linkHandle);
-
-	if (needFree && target.Buffer)
-		__free(target.Buffer);
-
-	//if (eProcess)
-	//	KeDetachProcess();
-
-	return status;
-}
-
 NTSTATUS ReadFileAlign(HANDLE FileHandle, PVOID Buffer, ULONG Length, ULONG AlignSize, LONGLONG Offset)
 {
 	ULONG AlignedSize = (Length / AlignSize + (Length % AlignSize ? 1 : 0)) * AlignSize;
@@ -532,7 +278,7 @@ NTSTATUS GetVolumeBitmapInfo(ULONG DiskNum, ULONG PartitionNum, PVOLUME_BITMAP_B
 	if (!lpBitmap)
 		return STATUS_UNSUCCESSFUL;
 
-	swprintf(VolumeName, L"\\??\\Harddisk%dPartition%d", DiskNum, PartitionNum);
+	swprintf_s(VolumeName, MAX_PATH, L"\\Device\\Harddisk%d\\Partition%d", DiskNum, PartitionNum);
 
 	RtlInitUnicodeString(&FileName, VolumeName);
 
@@ -557,20 +303,10 @@ NTSTATUS GetVolumeBitmapInfo(ULONG DiskNum, ULONG PartitionNum, PVOLUME_BITMAP_B
 		STARTING_LCN_INPUT_BUFFER StartingLCN;
 		ULONG BitmapSize = 0;
 
-		/*ZwFsControlFile(FileHandle,
-			NULL,
-			NULL,
-			NULL,
-			&ioBlock,
-			FSCTL_LOCK_VOLUME,
-			NULL, 0, NULL, 0
-		);*/
-
 		StartingLCN.StartingLcn.QuadPart = 0;
 		do
 		{
 			BitmapSize += 1024 * 1024; // 1MB
-			//BitmapSize += 10240; // 10KB
 
 			pInfo = (PVOLUME_BITMAP_BUFFER)__malloc(BitmapSize);
 			if (!pInfo)
@@ -604,213 +340,9 @@ NTSTATUS GetVolumeBitmapInfo(ULONG DiskNum, ULONG PartitionNum, PVOLUME_BITMAP_B
 		}
 		else
 		{
-			/*
-			// 跳过NTFS MFT簇
-			NTFS_VOLUME_DATA_BUFFER NtfsVolumeData;
-			RtlZeroMemory(&NtfsVolumeData, sizeof(NtfsVolumeData));
-			status = ZwFsControlFile(FileHandle,
-				NULL,
-				NULL,
-				NULL,
-				&ioBlock,
-				FSCTL_GET_NTFS_VOLUME_DATA,
-				NULL,
-				0,
-				&NtfsVolumeData,
-				sizeof(NtfsVolumeData)
-			);
-			if (NT_SUCCESS(status))
-			{
-				ULONGLONG MftZoneStart = NtfsVolumeData.MftZoneStart.QuadPart;
-				ULONGLONG MftZoneEnd = NtfsVolumeData.MftZoneEnd.QuadPart;
-				LogInfo("MFT Zone cluster %llu -> %llu\n", MftZoneStart, MftZoneEnd);
-				for (ULONGLONG i = MftZoneStart; i <= MftZoneEnd; i++)
-				{
-					bitmap_set((PULONG)pInfo->Buffer, i, TRUE);
-				}
-				DWORD bytesRead = 0;
-				ULONGLONG mftCount = NtfsVolumeData.MftValidDataLength.QuadPart / NtfsVolumeData.BytesPerFileRecordSegment;
-				NTFS_FILE_RECORD_INPUT_BUFFER inputBuffer;
-				ULONG outputBufferSize = sizeof(NTFS_FILE_RECORD_OUTPUT_BUFFER) + NtfsVolumeData.BytesPerFileRecordSegment - 1;
-				PNTFS_FILE_RECORD_OUTPUT_BUFFER outputBuffer = (PNTFS_FILE_RECORD_OUTPUT_BUFFER)__malloc(outputBufferSize);
-				PVOID bitmapDataBuffer = NULL;
-				ULONG bitmapDataSize = 0;
-				for (DWORD index = 0; index < 16; index++)
-				{
-					if (index == 8) // 跳过 $BadClus
-						continue;
-
-					RtlZeroMemory(&inputBuffer, sizeof(inputBuffer));
-					RtlZeroMemory(outputBuffer, outputBufferSize);
-					inputBuffer.FileReferenceNumber.LowPart = index;
-					status = ZwFsControlFile(FileHandle,
-						NULL,
-						NULL,
-						NULL,
-						&ioBlock,
-						FSCTL_GET_NTFS_FILE_RECORD,
-						&inputBuffer,
-						sizeof(inputBuffer),
-						outputBuffer,
-						outputBufferSize
-					);
-					if (!NT_SUCCESS(status))
-					{
-						LogWarn("Failed to read MFT record %d\n", index);
-						if (index > 0)
-							status = STATUS_SUCCESS;
-						continue;
-					}
-
-					// 跳过空记录
-					index = outputBuffer->FileReferenceNumber.LowPart;
-
-					PFILE_RECORD_SEGMENT_HEADER pHeader = (PFILE_RECORD_SEGMENT_HEADER)outputBuffer->FileRecordBuffer;
-					if (pHeader->Flags & 0x0004) // msdn 未定义，跳过
-						continue;
-					if (!(pHeader->Flags & 0x0001)) // 非标准文件
-						continue;
-					if (pHeader->SequenceNumber == 0) // 过时条目
-						continue;
-
-					BOOLEAN isDirectory = FALSE;
-					PATTRIBUTE_RECORD_HEADER pAttr = (PATTRIBUTE_RECORD_HEADER)((PUCHAR)pHeader + pHeader->FirstAttributeOffset);
-					while (pAttr->TypeCode != ATTR_END)
-					{
-						ATTRIBUTE_TYPE_CODE typeCode = pAttr->TypeCode;
-						UCHAR resident = pAttr->FormCode;
-
-						if (typeCode == 0x00)
-						{
-							if (isDirectory)
-								typeCode = ATTR_INDEX_ROOT;
-							else
-								typeCode = ATTR_DATA;
-						}
-
-						if (resident == 0x00)
-						{
-							void *ptr = (void *)((PUCHAR)pAttr + pAttr->Form.Resident.ValueOffset);
-
-							if (typeCode == ATTR_FILE_NAME)
-							{
-								PFILE_NAME_ATTRIBUTE pFileName = (PFILE_NAME_ATTRIBUTE)ptr;
-								if (pFileName->Flags & 0x01) // NTFS 长文件名
-								{
-									PWCHAR filename = pFileName->FileName;
-									ULONG parentID = pFileName->ParentDirectory.SegmentNumberLowPart;
-									filename[pFileName->FileNameLength] = 0;
-									isDirectory = (pFileName->FileAttributes & FILE_NAME_INDEX_PRESENT) != 0;
-									LogInfo("MFT %d: filename = %ls, parentId = %d, isDirectory = %d\n", index, filename, parentID, isDirectory);
-								}
-							}
-							else if (typeCode == ATTR_DATA)
-							{
-								LogInfo("MFT %d: data is resident\n", index);
-								// $Bitmap肯定不是resident
-								//if (index == 6)
-								//{
-								//	bitmapDataSize = pAttr->Form.Resident.ValueLength;
-								//	bitmapDataBuffer = __malloc(bitmapDataSize);
-								//	RtlCopyMemory(bitmapDataBuffer, ptr, bitmapDataSize);
-								//}
-							}
-						}
-						else
-						{
-							if (typeCode == ATTR_DATA)
-							{
-								LogInfo("MFT %d: data is non-resident\n", index);
-								if (index == 6)
-								{
-									bitmapDataSize = pAttr->Form.Nonresident.FileSize;
-									bitmapDataBuffer = __malloc(bitmapDataSize);
-									RtlZeroMemory(bitmapDataBuffer, bitmapDataSize);
-								}
-								PUCHAR dataRun = (PUCHAR)pAttr + pAttr->Form.Nonresident.MappingPairsOffset;
-								LONGLONG LCN = 0;
-								ULONGLONG VCN = 0;
-								while (*dataRun)
-								{
-									UCHAR lengthBytes = *dataRun & 0x0F;
-									UCHAR offsetBytes = *dataRun >> 4;
-									dataRun++;
-									LONGLONG length = 0;
-									memcpy(&length, dataRun, lengthBytes);
-									dataRun += lengthBytes;
-									LONGLONG lcnOffset = 0;
-									if (offsetBytes)
-									{
-										if (dataRun[offsetBytes - 1] & 0x80)
-											lcnOffset = -1;
-										memcpy(&lcnOffset, dataRun, offsetBytes);
-										dataRun += offsetBytes;
-									}
-									LCN += lcnOffset;
-									ULONGLONG StartLCN = lcnOffset == 0 ? 0 : LCN;
-									LogInfo("MFT %d: VCN %llu LCN %lld Clusters %lld\n", index, VCN, StartLCN, length);
-									for (ULONGLONG i = 0; i <= length; i++)
-									{
-										bitmap_set((PULONG)pInfo->Buffer, StartLCN + i, TRUE);
-									}
-
-									if (index == 6)
-									{
-										ULONGLONG volumeOffset = LCN * NtfsVolumeData.BytesPerCluster;
-										ULONGLONG offset = VCN * NtfsVolumeData.BytesPerCluster;
-										ULONGLONG readLength = min(length * NtfsVolumeData.BytesPerCluster, bitmapDataSize - offset);
-										status = ReadFileAlign(FileHandle, (PUCHAR)bitmapDataBuffer + offset, readLength, NtfsVolumeData.BytesPerSector, volumeOffset);
-										if (!NT_SUCCESS(status))
-										{
-											LogWarn("Read bitmap error. Offset %lld, virtual offset %lld, read length %lld, bytes read = %d, status = 0x%.8X\n", volumeOffset, offset, readLength, bytesRead, status);
-										}
-										status = STATUS_SUCCESS;
-									}
-
-									VCN += length;
-								}
-							}
-						}
-
-						// next
-						pAttr = (PATTRIBUTE_RECORD_HEADER)((PUCHAR)pAttr + pAttr->RecordLength);
-					}
-				}
-				__free(outputBuffer);
-				if (bitmapDataBuffer)
-				{
-					for (ULONGLONG i = 0; i < pInfo->BitmapSize.QuadPart; i++)
-					{
-						if (bitmap_test((PULONG)bitmapDataBuffer, i) && !bitmap_test((PULONG)pInfo->Buffer, i))
-						{
-							bitmap_set((PULONG)pInfo->Buffer, i, TRUE);
-							LogInfo("Bitmap difference: %llu\n", i);
-						}
-					}
-					__free(bitmapDataBuffer);
-				}
-				else
-				{
-					LogWarn("Bitmap file not found.\n");
-				}
-			}
-			else
-			{
-				status = STATUS_SUCCESS;
-			}
-			*/
 			LogInfo("Bitmap size = %llu\n", pInfo->BitmapSize.QuadPart);
 			*lpBitmap = pInfo;
 		}
-
-		/*ZwFsControlFile(FileHandle,
-			NULL,
-			NULL,
-			NULL,
-			&ioBlock,
-			FSCTL_UNLOCK_VOLUME,
-			NULL, 0, NULL, 0
-		);*/
 
 		ZwClose(FileHandle);
 	}
@@ -847,7 +379,7 @@ PVOID GetFileClusterList(HANDLE hFile)
 		pVcnPairs = (RETRIEVAL_POINTERS_BUFFER *)__malloc(ulOutPutSize);
 		if (pVcnPairs == NULL)
 		{
-			return FALSE;
+			return NULL;
 		}
 	}
 
@@ -1031,7 +563,7 @@ NTSTATUS GetPartNumFromVolLetter(WCHAR Letter, PULONG DiskNum, PULONG PartitionN
 	IO_STATUS_BLOCK IoStatusBlock;
 
 	WCHAR volumeDosName[MAX_PATH];
-	swprintf(volumeDosName, L"\\??\\%c:", Letter);
+	swprintf_s(volumeDosName, MAX_PATH, L"\\??\\%c:", Letter);
 
 	RtlInitUnicodeString(&fileName, volumeDosName);
 
@@ -1138,7 +670,7 @@ void ChangeDriveIconProtect(WCHAR volume)
 	{
 		WCHAR	volumeName[10];
 		HANDLE	subKey;
-		swprintf(volumeName, L"%c", volume);
+		swprintf_s(volumeName, 10, L"%c", volume);
 
 		RtlInitUnicodeString(&keyPath, volumeName);
 
@@ -1462,6 +994,172 @@ NTSTATUS ReadRegString(PUNICODE_STRING RegPath, PWCHAR KeyName, PWCHAR Buffer, U
 	return status;
 }
 
+NTSTATUS ReadLinkTarget(PUNICODE_STRING LinkPath, PUNICODE_STRING LinkTarget, PULONG ReturnedLength)
+{
+	HANDLE	linkHandle;
+	OBJECT_ATTRIBUTES	objectAttributes;
+	NTSTATUS	status;
+
+	LogInfo("Reading symbloic link %wZ\n", LinkPath);
+	InitializeObjectAttributes(&objectAttributes,
+		LinkPath,
+		OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+		NULL,
+		NULL);
+
+	status = ZwOpenSymbolicLinkObject(&linkHandle, GENERIC_READ, &objectAttributes);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	status = ZwQuerySymbolicLinkObject(linkHandle, LinkTarget, ReturnedLength);
+	ZwClose(linkHandle);
+
+	return status;
+}
+
+NTSTATUS
+AdjustPrivilege(
+	IN ULONG    Privilege,
+	IN BOOLEAN  Enable
+)
+{
+	NTSTATUS            status;
+	HANDLE              token_handle;
+	TOKEN_PRIVILEGES    token_privileges;
+
+	status = ZwOpenProcessToken(
+		NtCurrentProcess(),
+		TOKEN_ALL_ACCESS,
+		&token_handle
+	);
+
+	if (!NT_SUCCESS(status))
+	{
+		return status;
+	}
+
+	token_privileges.PrivilegeCount = 1;
+	token_privileges.Privileges[0].Luid = RtlConvertUlongToLuid(Privilege);
+	token_privileges.Privileges[0].Attributes = Enable ? SE_PRIVILEGE_ENABLED : 0;
+
+	status = ZwAdjustPrivilegesToken(
+		token_handle,
+		FALSE,
+		&token_privileges,
+		sizeof(token_privileges),
+		NULL,
+		NULL
+	);
+
+	ZwClose(token_handle);
+
+	return status;
+}
+
+NTSTATUS StringToNum(PWCHAR String, PULONG RetNum, BOOLEAN Strict)
+{
+	ULONG Number = 0;
+	for (size_t i = 0; String[i] != L'\0'; i++)
+	{
+		if (!(String[i] >= L'0' && String[i] <= L'9'))
+		{
+			if (Strict)
+				return STATUS_INVALID_PARAMETER;
+			break;
+		}
+		Number = Number * 10 + (String[i] - L'0');
+	}
+	*RetNum = Number;
+	return STATUS_SUCCESS;
+}
+
+void SafeReboot()
+{
+	HANDLE FileHandle = NULL;
+	IO_STATUS_BLOCK IoStatus;
+	PFILE_OBJECT FileObject;
+	NTSTATUS status;
+	UNICODE_STRING FilePath;
+
+	FilePath = RTL_CONSTANT_STRING(L"\\SystemRoot");
+
+	if (*NtBuildNumber <= 3790) // XP上在启动阶段SystemRoot链接指向的ArcName对象不存在，特殊处理
+	{
+		ULONG DiskNum = 0, PartNum = 0;
+		WCHAR SystemPath[MAX_PATH];
+		UNICODE_STRING LinkTarget;
+		RtlInitEmptyUnicodeString(&LinkTarget, SystemPath, sizeof(SystemPath));
+		status = ReadLinkTarget(&FilePath, &LinkTarget, NULL);
+		if (NT_SUCCESS(status))
+		{
+			LogInfo("%wZ -> %wZ\n", &FilePath, &LinkTarget);
+			SystemPath[LinkTarget.Length / 2] = L'\0';
+			_wcsupr(SystemPath);
+			status = STATUS_UNSUCCESSFUL;
+			WCHAR DiskNumPattern[] = L"\\ARCNAME\\MULTI(0)DISK(0)RDISK(", PartNumPattern[] = L")PARTITION(", EndPattern[] = L")";
+			PWCHAR DiskNumPtr = wcsstr(SystemPath, DiskNumPattern);
+			if (DiskNumPtr != NULL)
+			{
+				DiskNumPtr += wcslen(DiskNumPattern);
+				PWCHAR PartNumPtr = wcsstr(DiskNumPtr, PartNumPattern);
+				if (PartNumPtr != NULL)
+				{
+					*PartNumPtr = L'\0';
+					PartNumPtr += wcslen(PartNumPattern);
+					PWCHAR EndPtr = wcsstr(PartNumPtr, EndPattern);
+					if (EndPtr != NULL)
+					{
+						*EndPtr = L'\0';
+						status = NT_SUCCESS(StringToNum(DiskNumPtr, &DiskNum)) && NT_SUCCESS(StringToNum(PartNumPtr, &PartNum));
+					}
+				}
+			}
+		}
+		else
+		{
+			LogWarn("Failed to read symbolic link %wZ, error code=0x%.8X\n", &FilePath, status);
+		}
+		if (NT_SUCCESS(status))
+		{
+			LogInfo("System disk number = %lu, partition number = %lu\n", DiskNum, PartNum);
+			WCHAR VolumeName[MAX_PATH];
+			swprintf_s(VolumeName, MAX_PATH, L"\\Device\\Harddisk%d\\Partition%d", DiskNum, PartNum);
+			RtlInitUnicodeString(&FilePath, VolumeName);
+		}
+		status = GetFileHandleReadOnly(&FileHandle, &FilePath);
+	}
+	else
+	{
+		status = GetFileHandleReadOnly(&FileHandle, &FilePath);
+	}
+
+	if (NT_SUCCESS(status))
+	{
+		UNICODE_STRING FilePathNew = RTL_CONSTANT_STRING(L"\\Windows\\bootstat.dat");
+		status = IrpCreateFile(&FileObject, FILE_READ_ATTRIBUTES, FileHandle, &FilePathNew, &IoStatus, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_OPEN, 0, NULL, 0);
+		ZwClose(FileHandle);
+		if (NT_SUCCESS(status))
+		{
+			FILE_BASIC_INFORMATION FileBasicInfo = { 0 };
+			FILE_DISPOSITION_INFORMATION FileDispInfo = { 0 };
+			FileBasicInfo.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+			IrpSetInformationFile(FileObject, &IoStatus, &FileBasicInfo, sizeof(FileBasicInfo), FileBasicInformation);
+			FileDispInfo.DeleteFile = TRUE;
+			IrpSetInformationFile(FileObject, &IoStatus, &FileDispInfo, sizeof(FileDispInfo), FileDispositionInformation);
+			ObDereferenceObject(FileObject);
+		}
+		else
+		{
+			LogWarn("Failed to open %wZ, error code=0x%.8X\n", &FilePathNew, status);
+		}
+	}
+	else
+	{
+		LogWarn("Failed to locate %wZ, error code=0x%.8X\n", &FilePath, status);
+	}
+	NtShutdownSystem(1);
+}
+
 #pragma pack(push, 1)
 // Starting at offset 36 into the BPB, this is the structure for a FAT12/16 FS
 typedef struct _BPBFAT1216_struct {
@@ -1516,13 +1214,13 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 {
 	UCHAR sectorBuf0[512];
 	UCHAR sectorBuf[512];
-	BPB_struct bpb; // = (BPB_struct*)sectorBuf0;
+	BPB_struct bpb;
 	UINT scl, val, ssa, fat;
 	IO_STATUS_BLOCK IoStatus = { 0 };
 	LARGE_INTEGER Offset = { 0 };
 
 	LogInfo("Initializating disk file with size %llu\n", FileSize);
-	ULONG BufferSize = 20 * 1024 * 1024;
+	ULONG BufferSize = 20 * 1024 * 1024; // 20MB
 	PUCHAR Buffer = (PUCHAR)__malloc(BufferSize);
 	memset(Buffer, 0, BufferSize);
 	ULONGLONG Cur = 0;
@@ -1552,24 +1250,15 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	bpb.SectorsPerCluster = 32;        // this may change based on drive size
 	bpb.ReservedSectorCount = 32;
 	bpb.NumFATs = 2;
-	//bpb.RootEntryCount = 0;
-	//bpb.TotalSectors16 = 0;
 	bpb.Media = 0xf8;
-	//bpb.FATSize16 = 0;
 	bpb.SectorsPerTrack = 32;          // unknown here
 	bpb.NumberOfHeads = 64;            // ?
-	//bpb.HiddenSectors = 0;
 	bpb.TotalSectors32 = FileSize / 0x200;
 	// BPB-FAT32 Extension
 	bpb.FSTypeSpecificData.fat32.FATSize = FileSize / 0x200 / 4095;
-	//bpb.FSTypeSpecificData.fat32.ExtFlags = 0;
-	//bpb.FSTypeSpecificData.fat32.FSVersion = 0;
 	bpb.FSTypeSpecificData.fat32.RootCluster = 2;
 	bpb.FSTypeSpecificData.fat32.FSInfo = 1;
 	bpb.FSTypeSpecificData.fat32.BkBootSec = 6;
-	//memset( bpb.FSTypeSpecificData.fat32.Reserved, 0x00, 12 );
-	//bpb.FSTypeSpecificData.fat32.BS_DriveNumber = 0;
-	//bpb.FSTypeSpecificData.fat32.BS_Reserved1 = 0;
 	bpb.FSTypeSpecificData.fat32.BS_BootSig = 0x29;
 	bpb.FSTypeSpecificData.fat32.BS_VolumeID = 0xfbf4499b;      // hardcoded volume id.  this is weird.  should be generated each time.
 	memset(bpb.FSTypeSpecificData.fat32.BS_VolumeLabel, 0x20, 11);
@@ -1583,15 +1272,12 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	// ending signatures
 	sectorBuf0[0x1fe] = 0x55;
 	sectorBuf0[0x1ff] = 0xAA;
-	//write_sector(sectorBuf0, 0);
-	Offset.QuadPart = 0 * 512ull;
+	Offset.QuadPart = 0;
 	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf0, 512, &Offset, NULL);
 	LogInfo("Write boot sector ok\n");
 
 	// set up key sectors...
-
 	ssa = (bpb.NumFATs * bpb.FSTypeSpecificData.fat32.FATSize) + fat;
-
 	// FSInfo sector
 	memset(sectorBuf, 0x00, 0x200);
 	*((UINT*)sectorBuf) = 0x41615252;
@@ -1606,60 +1292,18 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	Offset.QuadPart = 1 * 512ull;
 	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
 	LogInfo("Write FSInfo sector ok\n");
-	fat = bpb.ReservedSectorCount;
 
-	memset(sectorBuf, 0x00, 0x200);
-	for (scl = 2; scl < bpb.SectorsPerCluster; scl++)
-	{
-		memset(sectorBuf, 0x00, 0x200);
-		//write_sector(sectorBuf, scl);
-		Offset.QuadPart = scl * 512ull;
-		ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
-	}
+	fat = bpb.ReservedSectorCount;
 	// write backup copy of metadata
 	//write_sector(sectorBuf0, 6);
 	Offset.QuadPart = 6 * 512ull;
 	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf0, 512, &Offset, NULL);
 	LogInfo("Write metadata sector ok\n");
 
-	// make Root Directory 
-
-// whack ROOT directory file: SSA = RSC + FN x SF + ceil((32 x RDE)/SS)  and LSN = SSA + (CN-2) x SC
-// this clears the first cluster of the root directory
-	memset(sectorBuf, 0x00, 0x200);     // 0x00000000 is the unallocated marker
-	for (scl = ssa + bpb.SectorsPerCluster; scl >= ssa; scl--)
-	{
-		//write_sector(sectorBuf, scl);
-		Offset.QuadPart = scl * 512ull;
-		ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
-	}
-
-	/*// whack a few clusters 1/4th through the partition as well.
-	// FIXME: This is a total hack, based on observed behavior.  use determinism
-	for (scl=(10 * bpb->SectorsPerCluster); scl>0; scl--)
-	{
-		dbg_printf("wiping sector %x", scl+(bpb->TotalSectors32 / 2048));
-		write_sector( sectorBuf, scl+(bpb->TotalSectors32 / 2048) );
-	}*/
-
-	memset(sectorBuf, 0x00, 0x200);     // 0x00000000 is the unallocated marker
-	for (scl = fat; scl < ssa / 2; scl++)
-	{
-		//write_sector(sectorBuf, scl);
-		Offset.QuadPart = scl * 512ull;
-		ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
-		//write_sector(sectorBuf, scl + (ssa / 2));
-		Offset.QuadPart = (scl + (ssa / 2)) * 512ull;
-		ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
-	}
-
-	//SSA = RSC + FN x SF + ceil((32 x RDE)/SS)  and LSN = SSA + (CN-2) x SC
-
-
+	memset(sectorBuf, 0x00, 0x200);
 	*((UINT*)(sectorBuf + 0x000)) = 0x0ffffff8;   // special - EOF marker
 	*((UINT*)(sectorBuf + 0x004)) = 0x0fffffff;   // special and clean
 	*((UINT*)(sectorBuf + 0x008)) = 0x0ffffff8;   // root directory (one cluster)
-	//write_sector(sectorBuf, bpb.SectorsPerCluster);
 	Offset.QuadPart = bpb.SectorsPerCluster * 512ull;
 	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
 	LogInfo("Write root directory ok\n");
@@ -1671,4 +1315,13 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	Offset.QuadPart = ssa * 512ll;
 	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
 	LogInfo("Write volume label ok\n");
+}
+
+int _COMPAT_swprintf_s(wchar_t * _Dst, size_t _SizeInWords, const wchar_t * _Format, ...)
+{
+	va_list ap;
+	va_start(ap, _Format);
+	int res = _vsnwprintf(_Dst, _SizeInWords, _Format, ap);
+	va_end(ap);
+	return res;
 }

@@ -1,35 +1,11 @@
 #include "ThawSpace.h"
 #include <ntdddisk.h>
-#include <ntddcdrm.h>
 #include <ntstrsafe.h>
 #include <wdmsec.h>
 #include <mountmgr.h>
 #include <ntddvol.h>
 #include <ntddscsi.h>
-
-extern "C"
-{
-	NTSYSAPI
-		NTSTATUS
-		NTAPI
-		ZwOpenProcessToken(
-			IN HANDLE       ProcessHandle,
-			IN ACCESS_MASK  DesiredAccess,
-			OUT PHANDLE     TokenHandle
-		);
-
-	NTSYSAPI
-		NTSTATUS
-		NTAPI
-		ZwAdjustPrivilegesToken(
-			IN HANDLE               TokenHandle,
-			IN BOOLEAN              DisableAllPrivileges,
-			IN PTOKEN_PRIVILEGES    NewState,
-			IN ULONG                BufferLength,
-			OUT PTOKEN_PRIVILEGES   PreviousState OPTIONAL,
-			OUT PULONG              ReturnLength
-		);
-}
+#include "Utils.h"
 
 #define DEVICE_BASE_NAME L"\\ThawSpace"
 #define DEVICE_DIR_NAME L"\\Device" DEVICE_BASE_NAME
@@ -63,12 +39,6 @@ typedef struct _DEVICE_EXTENSION {
 VOID
 ThawSpaceThread(
 	IN PVOID            Context
-);
-
-NTSTATUS
-ThawSpaceAdjustPrivilege(
-	IN ULONG            Privilege,
-	IN BOOLEAN          Enable
 );
 
 NTSTATUS
@@ -410,7 +380,6 @@ ThawSpaceDeviceControl(
 	switch (io_stack->Parameters.DeviceIoControl.IoControlCode)
 	{
 	case IOCTL_DISK_CHECK_VERIFY:
-	case IOCTL_CDROM_CHECK_VERIFY:
 	case IOCTL_STORAGE_CHECK_VERIFY:
 	case IOCTL_STORAGE_CHECK_VERIFY2:
 	{
@@ -420,7 +389,6 @@ ThawSpaceDeviceControl(
 	}
 
 	case IOCTL_DISK_GET_DRIVE_GEOMETRY:
-	case IOCTL_CDROM_GET_DRIVE_GEOMETRY:
 	{
 		PDISK_GEOMETRY  disk_geometry;
 		ULONGLONG       length;
@@ -558,58 +526,6 @@ ThawSpaceDeviceControl(
 	{
 		status = STATUS_SUCCESS;
 		Irp->IoStatus.Information = 0;
-		break;
-	}
-
-	case IOCTL_CDROM_READ_TOC:
-	{
-		PCDROM_TOC cdrom_toc;
-
-		if (io_stack->Parameters.DeviceIoControl.OutputBufferLength <
-			sizeof(CDROM_TOC))
-		{
-			status = STATUS_BUFFER_TOO_SMALL;
-			Irp->IoStatus.Information = 0;
-			break;
-		}
-
-		cdrom_toc = (PCDROM_TOC)Irp->AssociatedIrp.SystemBuffer;
-
-		RtlZeroMemory(cdrom_toc, sizeof(CDROM_TOC));
-
-		cdrom_toc->FirstTrack = 1;
-		cdrom_toc->LastTrack = 1;
-		cdrom_toc->TrackData[0].Control = TOC_DATA_TRACK;
-
-		status = STATUS_SUCCESS;
-		Irp->IoStatus.Information = sizeof(CDROM_TOC);
-
-		break;
-	}
-
-	case IOCTL_CDROM_GET_LAST_SESSION:
-	{
-		PCDROM_TOC_SESSION_DATA cdrom_toc_s_d;
-
-		if (io_stack->Parameters.DeviceIoControl.OutputBufferLength <
-			sizeof(CDROM_TOC_SESSION_DATA))
-		{
-			status = STATUS_BUFFER_TOO_SMALL;
-			Irp->IoStatus.Information = 0;
-			break;
-		}
-
-		cdrom_toc_s_d = (PCDROM_TOC_SESSION_DATA)Irp->AssociatedIrp.SystemBuffer;
-
-		RtlZeroMemory(cdrom_toc_s_d, sizeof(CDROM_TOC_SESSION_DATA));
-
-		cdrom_toc_s_d->FirstCompleteSession = 1;
-		cdrom_toc_s_d->LastCompleteSession = 1;
-		cdrom_toc_s_d->TrackData[0].Control = TOC_DATA_TRACK;
-
-		status = STATUS_SUCCESS;
-		Irp->IoStatus.Information = sizeof(CDROM_TOC_SESSION_DATA);
-
 		break;
 	}
 
@@ -819,67 +735,17 @@ ThawSpaceDeviceControl(
 		break;
 	}
 
-	case IOCTL_CDROM_READ_TOC_EX:
-	{
-		LogWarn("ThawSpace: Unhandled ioctl IOCTL_CDROM_READ_TOC_EX.\n");
-		status = STATUS_INVALID_DEVICE_REQUEST;
-		Irp->IoStatus.Information = 0;
-		break;
-	}
-	case IOCTL_DISK_GET_MEDIA_TYPES:
-	{
-		LogWarn("ThawSpace: Unhandled ioctl IOCTL_DISK_GET_MEDIA_TYPES.\n");
-		status = STATUS_INVALID_DEVICE_REQUEST;
-		Irp->IoStatus.Information = 0;
-		break;
-	}
-	case 0x66001b:
-	{
-		LogWarn("ThawSpace: Unhandled ioctl FT_BALANCED_READ_MODE.\n");
-		status = STATUS_INVALID_DEVICE_REQUEST;
-		Irp->IoStatus.Information = 0;
-		break;
-	}
-	case IOCTL_SCSI_GET_CAPABILITIES:
-	{
-		LogWarn("ThawSpace: Unhandled ioctl IOCTL_SCSI_GET_CAPABILITIES.\n");
-		status = STATUS_INVALID_DEVICE_REQUEST;
-		Irp->IoStatus.Information = 0;
-		break;
-	}
-	case IOCTL_SCSI_PASS_THROUGH:
-	{
-		LogWarn("ThawSpace: Unhandled ioctl IOCTL_SCSI_PASS_THROUGH.\n");
-		status = STATUS_INVALID_DEVICE_REQUEST;
-		Irp->IoStatus.Information = 0;
-		break;
-	}
-	case IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES:
-	{
-		LogWarn("ThawSpace: Unhandled ioctl IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES.\n");
-		status = STATUS_INVALID_DEVICE_REQUEST;
-		Irp->IoStatus.Information = 0;
-		break;
-	}
-	case IOCTL_STORAGE_QUERY_PROPERTY:
-	{
-		LogWarn("ThawSpace: Unhandled ioctl IOCTL_STORAGE_QUERY_PROPERTY.\n");
-		status = STATUS_INVALID_DEVICE_REQUEST;
-		Irp->IoStatus.Information = 0;
-		break;
-	}
-
 #if (NTDDI_VERSION < NTDDI_VISTA)
 #define IOCTL_VOLUME_QUERY_ALLOCATION_HINT CTL_CODE(IOCTL_VOLUME_BASE, 20, METHOD_OUT_DIRECT, FILE_READ_ACCESS)
 #endif  // NTDDI_VERSION < NTDDI_VISTA
 
+	case IOCTL_DISK_GET_MEDIA_TYPES:
+	case 0x66001b: // FT_BALANCED_READ_MODE
+	case IOCTL_SCSI_GET_CAPABILITIES:
+	case IOCTL_SCSI_PASS_THROUGH:
+	case IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES:
+	case IOCTL_STORAGE_QUERY_PROPERTY:
 	case IOCTL_VOLUME_QUERY_ALLOCATION_HINT:
-	{
-		LogWarn("ThawSpace: Unhandled ioctl IOCTL_VOLUME_QUERY_ALLOCATION_HINT.\n");
-		status = STATUS_INVALID_DEVICE_REQUEST;
-		Irp->IoStatus.Information = 0;
-		break;
-	}
 	default:
 	{
 		LogWarn(
@@ -923,7 +789,7 @@ ThawSpaceThread(
 
 	KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
 
-	ThawSpaceAdjustPrivilege(SE_IMPERSONATE_PRIVILEGE, TRUE);
+	AdjustPrivilege(SE_IMPERSONATE_PRIVILEGE, TRUE);
 
 	for (;;)
 	{
@@ -1081,88 +947,11 @@ ThawSpaceOpenFile(
 
 	if (NT_SUCCESS(status))
 	{
-		LogInfo("ThawSpace: File %wZ opened.\n", device_extension->file_name);
+		LogInfo("ThawSpace: File %wZ opened.\n", &device_extension->file_name);
 	}
-
-	if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_NO_SUCH_FILE)
+	else
 	{
-		if (device_extension->read_only || open_file_information->FileSize.QuadPart == 0)
-		{
-			LogErr("ThawSpace: File %wZ not found.\n", device_extension->file_name);
-			ExFreePool(device_extension->file_name.Buffer);
-			return STATUS_NO_SUCH_FILE;
-		}
-		else
-		{
-			status = ZwCreateFile(
-				&device_extension->file_handle,
-				GENERIC_READ | GENERIC_WRITE,
-				&object_attributes,
-				&io_status,
-				NULL,
-				FILE_ATTRIBUTE_NORMAL,
-				0,
-				FILE_OPEN_IF,
-				FILE_NON_DIRECTORY_FILE |
-				FILE_RANDOM_ACCESS |
-				FILE_NO_INTERMEDIATE_BUFFERING |
-				FILE_SYNCHRONOUS_IO_NONALERT,
-				NULL,
-				0
-			);
-
-			if (!NT_SUCCESS(status))
-			{
-				LogErr("ThawSpace: File %wZ could not be created. status=0x%.8X\n", device_extension->file_name, status);
-				ExFreePool(device_extension->file_name.Buffer);
-				return status;
-			}
-
-			if (io_status.Information == FILE_CREATED)
-			{
-				LogInfo("ThawSpace: File %wZ created.\n", device_extension->file_name);
-				/*status = ZwFsControlFile(
-					device_extension->file_handle,
-					NULL,
-					NULL,
-					NULL,
-					&io_status,
-					FSCTL_SET_SPARSE,
-					NULL,
-					0,
-					NULL,
-					0
-				);
-
-				if (NT_SUCCESS(status))
-				{
-					LogInfo("ThawSpace: File attributes set to sparse.\n");
-				}*/
-
-				file_eof.EndOfFile.QuadPart = open_file_information->FileSize.QuadPart;
-
-				status = ZwSetInformationFile(
-					device_extension->file_handle,
-					&io_status,
-					&file_eof,
-					sizeof(FILE_END_OF_FILE_INFORMATION),
-					FileEndOfFileInformation
-				);
-
-				if (!NT_SUCCESS(status))
-				{
-					LogErr("ThawSpace: eof could not be set. status=0x%.8X\n", status);
-					ExFreePool(device_extension->file_name.Buffer);
-					ZwClose(device_extension->file_handle);
-					return status;
-				}
-				LogInfo("ThawSpace: eof set to %I64u.\n", file_eof.EndOfFile.QuadPart);
-			}
-		}
-	}
-	else if (!NT_SUCCESS(status))
-	{
-		LogErr("ThawSpace: File %wZ could not be opened. status=0x%.8X\n", device_extension->file_name, status);
+		LogErr("ThawSpace: File %wZ could not be opened. status=0x%.8X\n", &device_extension->file_name, status);
 		ExFreePool(device_extension->file_name.Buffer);
 		return status;
 	}
@@ -1253,9 +1042,9 @@ ThawSpaceOpenFile(
 	swprintf_s(sym_link_name, 256, L"\\??\\%c:", device_extension->drive_letter);
 	RtlInitUnicodeString(&sym_link, sym_link_name);
 	IoCreateSymbolicLink(&sym_link, &device_extension->device_name);
-	LogInfo("ThawSpace: Symbolic link %wZ -> %wZ\n", device_extension->device_name, sym_link);
+	LogInfo("ThawSpace: Symbolic link %wZ -> %wZ\n", &device_extension->device_name, &sym_link);
 
-	LogInfo("ThawSpace: File %wZ mount on %c: ok.\n", device_extension->file_name, device_extension->drive_letter);
+	LogInfo("ThawSpace: File %wZ mount on %c: ok.\n", &device_extension->file_name, device_extension->drive_letter);
 
 	return STATUS_SUCCESS;
 }
@@ -1291,45 +1080,6 @@ ThawSpaceCloseFile(
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS
-ThawSpaceAdjustPrivilege(
-	IN ULONG    Privilege,
-	IN BOOLEAN  Enable
-)
-{
-	NTSTATUS            status;
-	HANDLE              token_handle;
-	TOKEN_PRIVILEGES    token_privileges;
-
-	status = ZwOpenProcessToken(
-		NtCurrentProcess(),
-		TOKEN_ALL_ACCESS,
-		&token_handle
-	);
-
-	if (!NT_SUCCESS(status))
-	{
-		return status;
-	}
-
-	token_privileges.PrivilegeCount = 1;
-	token_privileges.Privileges[0].Luid = RtlConvertUlongToLuid(Privilege);
-	token_privileges.Privileges[0].Attributes = Enable ? SE_PRIVILEGE_ENABLED : 0;
-
-	status = ZwAdjustPrivilegesToken(
-		token_handle,
-		FALSE,
-		&token_privileges,
-		sizeof(token_privileges),
-		NULL,
-		NULL
-	);
-
-	ZwClose(token_handle);
-
-	return status;
-}
-
 BOOLEAN
 IsThawSpaceDevice(
 	IN PDEVICE_OBJECT DeviceObject
@@ -1343,5 +1093,5 @@ IsThawSpaceDevice(
 		return FALSE;
 
 	device_extension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-	return device_extension->magic == THAWSPACE_MAGIC;
+	return device_extension != NULL && device_extension->magic == THAWSPACE_MAGIC;
 }

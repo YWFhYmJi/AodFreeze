@@ -209,7 +209,7 @@
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="diskperf.c" />
+    <ClCompile Include="diskfltlib.c" />
     <ClCompile Include="DPBitmap.cpp" />
     <ClCompile Include="DiskFilter.cpp" />
     <ClCompile Include="IrpFile.cpp" />
@@ -220,7 +220,7 @@
     <ClCompile Include="Utils.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="diskperf.h" />
+    <ClInclude Include="diskfltlib.h" />
     <ClInclude Include="DPBitmap.h" />
     <ClInclude Include="fatlbr.h" />
     <ClInclude Include="IrpFile.h" />
