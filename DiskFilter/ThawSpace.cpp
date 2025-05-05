@@ -11,29 +11,25 @@
 #define DEVICE_DIR_NAME L"\\Device" DEVICE_BASE_NAME
 #define DEVICE_NAME_PREFIX DEVICE_DIR_NAME DEVICE_BASE_NAME
 
-#define TOC_DATA_TRACK 0x04
-
 #define THAWSPACE_MAGIC 0xD1572222D1572222
 
-HANDLE dir_handle;
+static HANDLE dir_handle = NULL;
 
 typedef struct _DEVICE_EXTENSION {
 	ULONG64                     magic;
 	BOOLEAN                     media_in_device;
 	UNICODE_STRING              device_name;
 	ULONG                       device_number;
-	DEVICE_TYPE                 device_type;
 	HANDLE                      file_handle;
 	UNICODE_STRING              file_name;
 	LARGE_INTEGER               file_size;
 	BOOLEAN                     read_only;
-	PSECURITY_CLIENT_CONTEXT    security_client_context;
 	LIST_ENTRY                  list_head;
 	KSPIN_LOCK                  list_lock;
 	KEVENT                      request_event;
 	PVOID                       thread_pointer;
 	BOOLEAN                     terminate_thread;
-	UCHAR                       drive_letter;
+	WCHAR                       drive_letter;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 VOID
@@ -78,7 +74,7 @@ ThawSpaceInit(
 	
 	for (n = 0, n_created_devices = 0; n < NumberOfDevices; n++)
 	{
-		status = ThawSpaceCreateDevice(DriverObject, n, FILE_DEVICE_DISK);
+		status = ThawSpaceCreateDevice(DriverObject, n);
 
 		if (NT_SUCCESS(status))
 		{
@@ -92,8 +88,7 @@ ThawSpaceInit(
 NTSTATUS
 ThawSpaceCreateDevice(
 	IN PDRIVER_OBJECT   DriverObject,
-	IN ULONG            Number,
-	IN DEVICE_TYPE      DeviceType
+	IN ULONG            Number
 )
 {
 	UNICODE_STRING      device_name;
@@ -123,7 +118,7 @@ ThawSpaceCreateDevice(
 		DriverObject,
 		sizeof(DEVICE_EXTENSION),
 		&device_name,
-		DeviceType,
+		FILE_DEVICE_DISK,
 		0,
 		FALSE,
 		&sddl,
@@ -148,7 +143,6 @@ ThawSpaceCreateDevice(
 	device_extension->device_name.MaximumLength = device_name.MaximumLength;
 	device_extension->device_name.Buffer = device_name.Buffer;
 	device_extension->device_number = Number;
-	device_extension->device_type = DeviceType;
 
 	InitializeListHead(&device_extension->list_head);
 
@@ -248,13 +242,6 @@ ThawSpaceDeleteDevice(
 		ExFreePool(device_extension->device_name.Buffer);
 	}
 
-	if (device_extension->security_client_context != NULL)
-	{
-		SeDeleteClientSecurity(device_extension->security_client_context);
-		ExFreePool(device_extension->security_client_context);
-	}
-
-#pragma prefast( suppress: 28175, "allowed in unload" )
 	next_device_object = DeviceObject->NextDevice;
 
 	IoDeleteDevice(DeviceObject);
@@ -284,7 +271,8 @@ ThawSpaceUnload(
 		}
 	}
 
-	ZwClose(dir_handle);
+	if (dir_handle != NULL)
+		ZwClose(dir_handle);
 }
 
 NTSTATUS
@@ -586,7 +574,7 @@ ThawSpaceDeviceControl(
 
 		number = (PSTORAGE_DEVICE_NUMBER)Irp->AssociatedIrp.SystemBuffer;
 
-		number->DeviceType = device_extension->device_type;
+		number->DeviceType = FILE_DEVICE_DISK;
 		number->DeviceNumber = device_extension->device_number;
 		number->PartitionNumber = (ULONG)-1;
 
@@ -895,8 +883,6 @@ ThawSpaceOpenFile(
 	FILE_STANDARD_INFORMATION       file_standard;
 	FILE_ALIGNMENT_INFORMATION      file_alignment;
 	IO_STATUS_BLOCK                 io_status;
-	WCHAR                           sym_link_name[256];
-	UNICODE_STRING                  sym_link;
 
 	ASSERT(DeviceObject != NULL);
 	ASSERT(open_file_information != NULL);
@@ -1039,10 +1025,7 @@ ThawSpaceOpenFile(
 
 	device_extension->drive_letter = open_file_information->DriveLetter;
 
-	swprintf_s(sym_link_name, 256, L"\\??\\%c:", device_extension->drive_letter);
-	RtlInitUnicodeString(&sym_link, sym_link_name);
-	IoCreateSymbolicLink(&sym_link, &device_extension->device_name);
-	LogInfo("ThawSpace: Symbolic link %wZ -> %wZ\n", &device_extension->device_name, &sym_link);
+	MountVolume(&device_extension->device_name, device_extension->drive_letter);
 
 	LogInfo("ThawSpace: File %wZ mount on %c: ok.\n", &device_extension->file_name, device_extension->drive_letter);
 
@@ -1055,8 +1038,6 @@ ThawSpaceCloseFile(
 )
 {
 	PDEVICE_EXTENSION device_extension;
-	WCHAR             sym_link_name[256];
-	UNICODE_STRING    sym_link;
 
 	ASSERT(DeviceObject != NULL);
 
@@ -1070,9 +1051,7 @@ ThawSpaceCloseFile(
 
 		device_extension->media_in_device = FALSE;
 
-		swprintf_s(sym_link_name, 256, L"\\??\\%c:", device_extension->drive_letter);
-		RtlInitUnicodeString(&sym_link, sym_link_name);
-		IoDeleteSymbolicLink(&sym_link);
+		UnmountVolume(device_extension->drive_letter);
 
 		LogInfo("ThawSpace: Unmount %c: ok.\n", device_extension->drive_letter);
 	}

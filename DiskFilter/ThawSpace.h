@@ -2,9 +2,7 @@
 
 #include "Pch.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+EXTERN_C_START
 
 typedef struct _OPEN_FILE_INFORMATION {
 	LARGE_INTEGER       FileSize;
@@ -23,8 +21,7 @@ ThawSpaceInit(
 NTSTATUS
 ThawSpaceCreateDevice(
 	IN PDRIVER_OBJECT   DriverObject,
-	IN ULONG            Number,
-	IN DEVICE_TYPE      DeviceType
+	IN ULONG            Number
 );
 
 VOID
@@ -71,6 +68,4 @@ IsThawSpaceDevice(
 	IN PDEVICE_OBJECT DeviceObject
 );
 
-#ifdef __cplusplus
-}
-#endif
+EXTERN_C_END

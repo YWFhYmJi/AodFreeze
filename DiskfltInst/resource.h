@@ -13,6 +13,8 @@
 #define IDD_ADVSET                      208
 #define IDD_DIALOG2                     210
 #define IDD_ADDTHAWSPACE                210
+#define IDD_MOUNTMANAGE                 211
+#define IDD_ADDMOUNT                    212
 #define IDC_VOLUMELIST                  1000
 #define IDC_INSTALLSYS                  1001
 #define IDC_APPLY                       1002
@@ -41,11 +43,18 @@
 #define IDC_ADDNEW                      1030
 #define IDC_VOLLETTER                   1031
 #define IDC_FILESIZE                    1032
+#define IDC_PARTITION                   1032
 #define IDC_USEEXISTING                 1033
 #define IDC_FILEPATH                    1034
 #define IDC_BROWSE                      1035
 #define IDC_HIDE                        1036
 #define IDC_CREATENEW_MAINDRIVE         1037
+#define IDC_MOUNT_MANAGE                1037
+#define IDC_MOUNT_LIST                  1038
+#define IDC_ADD_MOUNT                   1039
+#define IDC_DELETE_MOUNT                1040
+#define IDC_REFRESH_LIST                1041
+#define IDC_READONLY                    1042
 
 // Next default values for new objects
 // 
@@ -53,7 +62,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        212
 #define _APS_NEXT_COMMAND_VALUE         32772
-#define _APS_NEXT_CONTROL_VALUE         1037
+#define _APS_NEXT_CONTROL_VALUE         1043
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif

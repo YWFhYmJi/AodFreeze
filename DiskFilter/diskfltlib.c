@@ -34,6 +34,7 @@ Notes:
 
 #include "diskfltlib.h"
 #include "ThawSpace.h"
+#include "DirectDisk.h"
 
 #ifdef POOL_TAGGING
 #ifdef ExAllocatePool
@@ -483,12 +484,12 @@ Return Value:
 	PDEVICE_EXTENSION   deviceExtension;
 
 	PAGED_CODE();
-	if (IsThawSpaceDevice(DeviceObject))
+	if (IsThawSpaceDevice(DeviceObject) || IsDirectDiskDevice(DeviceObject))
 	{
-		Irp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
+		Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
 		Irp->IoStatus.Information = 0;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		return STATUS_NOT_IMPLEMENTED;
+		return STATUS_INVALID_DEVICE_REQUEST;
 	}
 
 	DebugPrint((2, "DiskPerfDispatchPnp: Device %X Irp %X\n",
@@ -816,12 +817,14 @@ Return Value:
 	// add by tanwen 
 	if (DeviceObject == g_cdo && OnDiskFilterDispatchControl(DeviceObject, Irp, &mystatus))
 		return mystatus;
-	if (IsThawSpaceDevice(DeviceObject))
+	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
+		return STATUS_SUCCESS;
+	if (IsThawSpaceDevice(DeviceObject) || IsDirectDiskDevice(DeviceObject))
 	{
-		Irp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
+		Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
 		Irp->IoStatus.Information = 0;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		return STATUS_NOT_IMPLEMENTED;
+		return STATUS_INVALID_DEVICE_REQUEST;
 	}
 
 	IoSkipCurrentIrpStackLocation(Irp);
@@ -838,12 +841,12 @@ DiskPerfDispatchPower(
 )
 {
 	PDEVICE_EXTENSION deviceExtension;
-	if (IsThawSpaceDevice(DeviceObject))
+	if (IsThawSpaceDevice(DeviceObject) || IsDirectDiskDevice(DeviceObject))
 	{
-		Irp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
+		Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
 		Irp->IoStatus.Information = 0;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		return STATUS_NOT_IMPLEMENTED;
+		return STATUS_INVALID_DEVICE_REQUEST;
 	}
 
 	PoStartNextPowerIrp(Irp);
@@ -952,8 +955,14 @@ Return Value:
 	if (DeviceObject == g_cdo && OnDiskFilterDispatchControl(DeviceObject, Irp, &mystatus))
 		return mystatus;
 
+	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
+		return STATUS_SUCCESS;
+
 	if (IsThawSpaceDevice(DeviceObject))
 		return ThawSpaceCreateClose(DeviceObject, Irp);
+
+	if (IsDirectDiskDevice(DeviceObject))
+		return DirectDiskCreateClose(DeviceObject, Irp);
 
 	UNREFERENCED_PARAMETER(DeviceObject);
 
@@ -978,8 +987,14 @@ DiskPerfClose(
 	if (DeviceObject == g_cdo && OnDiskFilterDispatchControl(DeviceObject, Irp, &mystatus))
 		return mystatus;
 
+	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
+		return STATUS_SUCCESS;
+
 	if (IsThawSpaceDevice(DeviceObject))
 		return ThawSpaceCreateClose(DeviceObject, Irp);
+
+	if (IsDirectDiskDevice(DeviceObject))
+		return DirectDiskCreateClose(DeviceObject, Irp);
 
 	UNREFERENCED_PARAMETER(DeviceObject);
 
@@ -1033,8 +1048,14 @@ Return Value:
 	if (DeviceObject == g_cdo && OnDiskFilterDispatchControl(DeviceObject, Irp, &mystatus))
 		return mystatus;
 
+	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
+		return STATUS_SUCCESS;
+
 	if (IsThawSpaceDevice(DeviceObject))
 		return ThawSpaceReadWrite(DeviceObject, Irp);
+
+	if (IsDirectDiskDevice(DeviceObject))
+		return DirectDiskReadWrite(DeviceObject, Irp);
 
 	// add by tanwen
 	if (OnDiskFilterReadWrite(
@@ -1090,8 +1111,14 @@ Return Value:
 	if (DeviceObject == g_cdo && OnDiskFilterDispatchControl(DeviceObject, Irp, &mystatus))
 		return mystatus;
 
+	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
+		return STATUS_SUCCESS;
+
 	if (IsThawSpaceDevice(DeviceObject))
 		return ThawSpaceDeviceControl(DeviceObject, Irp);
+
+	if (IsDirectDiskDevice(DeviceObject))
+		return DirectDiskDeviceControl(DeviceObject, Irp);
 
 	// add by tanwen
 	if (OnDiskFilterDeviceControl(
@@ -1145,7 +1172,10 @@ Return Value:
 {
 	PDEVICE_EXTENSION  deviceExtension = DeviceObject->DeviceExtension;
 
-	if (IsThawSpaceDevice(DeviceObject))
+	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
+		return STATUS_SUCCESS;
+
+	if (IsThawSpaceDevice(DeviceObject) || IsDirectDiskDevice(DeviceObject))
 	{
 		Irp->IoStatus.Status = STATUS_SUCCESS;
 		Irp->IoStatus.Information = 0;
@@ -1189,6 +1219,10 @@ Return Value:
 --*/
 {
 	PAGED_CODE();
+
+	ThawSpaceUnload(DriverObject);
+
+	DirectDiskUnload(DriverObject);
 
 	OnDiskFilterUnload(DriverObject);
 

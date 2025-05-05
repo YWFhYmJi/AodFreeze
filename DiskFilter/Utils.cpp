@@ -7,6 +7,7 @@
 #include "messages.h"
 #include <stdarg.h>
 #include "IrpFile.h"
+#include <mountmgr.h>
 
 NTSTATUS KSleep(ULONG microSecond)
 {
@@ -651,10 +652,9 @@ void ChangeDriveIconProtect(WCHAR volume)
 
 	RtlInitUnicodeString(&keyPath, L"\\Registry\\Machine\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\DriveIcons");
 
-	//初始化objectAttributes 
 	InitializeObjectAttributes(&objectAttributes,
 		&keyPath,
-		OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,//对大小写敏感     
+		OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
 		NULL,
 		NULL);
 
@@ -676,7 +676,7 @@ void ChangeDriveIconProtect(WCHAR volume)
 
 		InitializeObjectAttributes(&objectAttributes,
 			&keyPath,
-			OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,//对大小写敏感     
+			OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
 			keyHandle,
 			NULL);
 
@@ -695,7 +695,7 @@ void ChangeDriveIconProtect(WCHAR volume)
 
 			InitializeObjectAttributes(&objectAttributes,
 				&keyPath,
-				OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,//对大小写敏感     
+				OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
 				subKey,
 				NULL);
 
@@ -1158,6 +1158,42 @@ void SafeReboot()
 		LogWarn("Failed to locate %wZ, error code=0x%.8X\n", &FilePath, status);
 	}
 	NtShutdownSystem(1);
+}
+
+NTSTATUS MountVolume(PUNICODE_STRING DeviceName, WCHAR VolumeLetter)
+{
+	WCHAR SymLinkName[MAX_PATH];
+	UNICODE_STRING SymLink;
+	NTSTATUS status;
+
+	VolumeLetter = toupper(VolumeLetter);
+	swprintf_s(SymLinkName, MAX_PATH, L"\\DosDevices\\Global\\%c:", VolumeLetter);
+	RtlInitUnicodeString(&SymLink, SymLinkName);
+	status = IoCreateSymbolicLink(&SymLink, DeviceName);
+	if (!NT_SUCCESS(status))
+	{
+		LogWarn("Failed to create symbolic link %wZ -> %wZ, error code=0x%.8X\n", DeviceName, &SymLink, status);
+		return status;
+	}
+	return status;
+}
+
+NTSTATUS UnmountVolume(WCHAR VolumeLetter)
+{
+	WCHAR SymLinkName[MAX_PATH];
+	UNICODE_STRING SymLink;
+	NTSTATUS status;
+
+	VolumeLetter = toupper(VolumeLetter);
+	swprintf_s(SymLinkName, MAX_PATH, L"\\DosDevices\\Global\\%c:", VolumeLetter);
+	RtlInitUnicodeString(&SymLink, SymLinkName);
+	status = IoDeleteSymbolicLink(&SymLink);
+	if (!NT_SUCCESS(status))
+	{
+		LogWarn("Failed to delete symbolic link %wZ, error code=0x%.8X\n", &SymLink, status);
+		return status;
+	}
+	return status;
 }
 
 #pragma pack(push, 1)

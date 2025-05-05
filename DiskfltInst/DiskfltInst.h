@@ -9,6 +9,7 @@
 #endif
 
 #include "resource.h"		// main symbols
+#include "DiskfltInstLib.hpp"
 
 
 // CDiskfltInstApp:
@@ -30,3 +31,4 @@ public:
 };
 
 extern CDiskfltInstApp theApp;
+extern DiskfltApi diskflt;

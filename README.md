@@ -1,5 +1,5 @@
 # AodFreeze
-傲盾还原v3.3 修改自 [傲盾还原 By dbgger@gmail.com](https://code.google.com/p/diskflt) \
+傲盾还原v3.4 修改自 [傲盾还原 By dbgger@gmail.com](https://code.google.com/p/diskflt) \
 支持Windows XP SP2及以上版本的32位、64位系统 \
 支持FAT、NTFS文件系统 \
 自动保护MBR、GPT的分区表（保护盘分区表无法修改） \
@@ -8,7 +8,24 @@
 **注意：开启驱动白名单后所有保护盘上原有的驱动会自动允许加载，不保护系统盘时不要开启驱动白名单** \
 修复了会导致NTFS文件系统损坏的BUG
 
+速度测试：
+![speedtest_w7.png](assests/speedtest_w7.png)
+![speedtest_w10.png](assests/speedtest_w10.png)
+
 ## 更新日志
+
+v3.4
+- 修复了很多BUG，旧版本有较大BUG，请不要使用
+- 增加了命令行管理程序 `diskfltmgmt.exe`
+- 增加了动态缓冲区监视程序 `DiskfltBufmon.exe`
+- 增加了直接挂载被保护硬盘的功能，可以在保护状态下读取/修改被保护的分区（注意：不能重复挂载分区，容易出现问题）
+- 驱动白名单、黑名单加载策略即时生效 \
+已知问题
+- ThawSpace在某些旧版系统中FAT32格式不可用，需要重新格式化成NTFS格式
+- 直接挂载FAT32分区在某些旧版系统中不可用
+#### 注意
+1. **在缓冲区不够用时，挂载直接读写会覆盖已有缓冲区，造成系统不稳定！**
+2. **进行读写挂载系统分区后没有保护，不会防止格式化操作！**
 
 V3.3
 - 修复了驱动白名单的BUG

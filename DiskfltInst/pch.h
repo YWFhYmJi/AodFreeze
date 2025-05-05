@@ -9,13 +9,5 @@
 
 // add headers that you want to pre-compile here
 #include "framework.h"
-#include "..\\DiskFilter\\Public.h"
-#include <afxwin.h>
-#include <afxwin.h>
-#include <afxwin.h>
-#include <afxwin.h>
-
-#define SERVICE_NAME L"DiskFilter"
-#define THAWSPACE_SERVICE_NAME L"ThawSpace"
 
 #endif //PCH_H

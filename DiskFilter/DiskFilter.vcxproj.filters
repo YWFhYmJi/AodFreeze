@@ -60,6 +60,9 @@
     <ClCompile Include="diskfltlib.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="DirectDisk.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="UsingCPP.hpp">
@@ -96,6 +99,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="diskfltlib.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="DirectDisk.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="DiskFilter.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

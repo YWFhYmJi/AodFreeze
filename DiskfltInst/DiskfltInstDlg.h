@@ -48,10 +48,7 @@ public:
 };
 
 extern BOOL _isDrvInstall;
-extern HANDLE _filterDevice;
 extern DISKFILTER_PROTECTION_CONFIG _config;
-extern CString _password;
-extern BOOL _protectEnabled;
-extern BOOL _allowDriverLoad;
+extern DISKFILTER_STATUS _curStatus;
 
-void SHA256(const PVOID lpData, size_t ulSize, UCHAR lpOutput[32]);
+extern CHAR GetVolLetterFromStorNum(DWORD diskNum, DWORD partNum);

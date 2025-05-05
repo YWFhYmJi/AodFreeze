@@ -1,14 +1,16 @@
 #include "diskfltlib.h"
-#include "DPBitmap.h"
+#include "DiskFilter.h"
 #include "Utils.h"
 #include "IrpFile.h"
 #include "mempool/mempool.h"
+#include <wdmsec.h>
 #include <ntimage.h>
 #include <ntddscsi.h>
 #include <wchar.h>
 #include <ntdddisk.h>
 #include "messages.h"
 #include "ThawSpace.h"
+#include "DirectDisk.h"
 
 // 引入函数，用于在屏幕上显示文字
 EXTERN_C VOID InbvAcquireDisplayOwnership(VOID);
@@ -20,60 +22,6 @@ EXTERN_C VOID InbvSetScrollRegion(ULONG left, ULONG top, ULONG width, ULONG heig
 EXTERN_C VOID InbvInstallDisplayStringFilter(ULONG b);
 EXTERN_C VOID InbvEnableDisplayString(ULONG b);
 
-// 扇区重定向信息
-typedef struct
-{
-	ULONGLONG	OriginalIndex;		// 原始簇地址
-	ULONGLONG	MappedIndex;		// 重定向后的地址
-} REDIRECT_INFO, *PREDIRECT_INFO;
-
-// 保护卷所用到的信息
-typedef struct _VOLUME_INFO
-{
-	WCHAR		Volume;				// 盘符
-
-	ULONG		DiskNumber;			// 此卷所在的硬盘号
-
-	DWORD		PartitionNumber;	// 分区索引
-	BYTE		PartitionType;		// 分区类型
-
-	LONGLONG	StartOffset;		// 分区在磁盘里的偏移也就是开始地址
-
-	LONGLONG	BytesTotal;			// 这个卷的总大小，以byte为单位
-	ULONG		BytesPerSector;		// 每个扇区的大小
-	ULONG		BytesPerCluster;	// 每簇大小
-	ULONGLONG	FirstDataSector;	// 第一个扇区的开始地址，也指位图上第一个簇的开始地址,NTFS固定为0,FAT专有
-
-	// 此卷逻辑上有多少个扇区
-	ULONGLONG		SectorCount;
-
-	// 标记空闲扇区 空扇区bit为0, 初始化的时候复制bitMap_OR
-	PDP_BITMAP		BitmapUsed;
-	// 标记扇区是否重定向
-	PDP_BITMAP		BitmapRedirect;
-	// 直接放过读写的扇区(force write)，如pagefile.sys hiberfil.sys, 位图跟是磁盘逻辑位图的一小部分
-	PDP_BITMAP		BitmapAllow;
-
-	// 上次扫描的空闲扇区的位置
-	ULONGLONG		LastScanIndex;
-
-	// 扇区重定向表
-	RTL_GENERIC_TABLE	RedirectMap;
-
-	//这个卷上的保护系统使用的请求队列
-	LIST_ENTRY				ListHead;
-	//这个卷上的保护系统使用的请求队列的锁
-	KSPIN_LOCK				ListLock;
-	//这个卷上的保护系统使用的请求队列的同步事件
-	KEVENT					RequestEvent;
-	//这个卷上的保护系统使用的请求队列的处理线程之线程句柄
-	PVOID					ReadWriteThread;
-	CLIENT_ID				ReadWriteThreadId;
-	//请求队列的处理线程结束标志
-	BOOLEAN					ThreadTerminate;
-
-} VOLUME_INFO, *PVOLUME_INFO;
-
 // 保护配置文件路径、文件对象、所在盘符、所在扇区
 UNICODE_STRING ConfigPath;
 PFILE_OBJECT ConfigFileObject;
@@ -83,14 +31,42 @@ PRETRIEVAL_POINTERS_BUFFER ConfigVcnPairs;
 PDEVICE_OBJECT LowerDeviceObject[256]; // 硬盘的下层设备
 PDEVICE_OBJECT FilterDevice; // 当前过滤器设备
 DISKFILTER_PROTECTION_CONFIG Config, NewConfig; // 当前保护配置、新配置
+ERESOURCE DriverListLock; // 驱动策略锁
 VOLUME_INFO ProtectVolumeList[256]; // 保护卷列表
 PVOLUME_INFO VolumeList[26]; // 盘符对应的保护卷
 UINT VaildVolumeCount; // 保护卷数量
 BOOLEAN IsProtect; // 是否在保护状态
 BOOLEAN AllowLoadDriver; // 是否允许加载驱动
+UINT DirectDiskCount; // 已挂载的直接读写卷数量
 
 // 读写操作线程
 void ThreadReadWrite(PVOID Context);
+
+// 检查配置文件是否有效
+BOOLEAN IsVaildConfig(PDISKFILTER_PROTECTION_CONFIG Config)
+{
+	// 头部不匹配
+	if (Config->Magic != DISKFILTER_CONFIG_MAGIC)
+		return FALSE;
+
+	// 版本不匹配
+	if (Config->Version != DISKFILTER_DRIVER_VERSION)
+		return FALSE;
+
+	// 保护卷个数无效
+	if (Config->ProtectVolumeCount > sizeof(Config->ProtectVolume) / sizeof(Config->ProtectVolume[0]))
+		return FALSE;
+
+	// 驱动白名单或黑名单个数无效
+	if (Config->DriverCount > sizeof(Config->DriverList) / sizeof(Config->DriverList[0]))
+		return FALSE;
+
+	// 解冻空间个数无效
+	if (Config->ThawSpaceCount > sizeof(Config->ThawSpacePath) / sizeof(Config->ThawSpacePath[0]))
+		return FALSE;
+
+	return TRUE;
+}
 
 // 获取卷信息
 NTSTATUS GetVolumeInfo(ULONG DiskNum, DWORD PartitionNum, PVOLUME_INFO info)
@@ -292,26 +268,8 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 
 	LogInfo("Magic=0x%.4X, Version=0x%.4X, Flags=%.2X\n", Conf->Magic, Conf->Version, Conf->ProtectionFlags);
 
-	// 检查配置文件是否有效
-	// 头部不匹配
-	if (Conf->Magic != DISKFILTER_CONFIG_MAGIC)
-		return STATUS_UNSUCCESSFUL + 10;
-
-	// 版本不匹配
-	if (Conf->Version != DISKFILTER_DRIVER_VERSION)
-		return STATUS_UNSUCCESSFUL + 11;
-
-	// 保护卷个数无效
-	if (Conf->ProtectVolumeCount > sizeof(Conf->ProtectVolume) / sizeof(Conf->ProtectVolume[0]))
-		return STATUS_UNSUCCESSFUL + 12;
-
-	// 驱动白名单或黑名单个数无效
-	if (Conf->DriverCount > sizeof(Conf->DriverList) / sizeof(Conf->DriverList[0]))
-		return STATUS_UNSUCCESSFUL + 13;
-
-	// 解冻空间个数无效
-	if (Conf->ThawSpaceCount > sizeof(Conf->ThawSpacePath) / sizeof(Conf->ThawSpacePath[0]))
-		return STATUS_UNSUCCESSFUL + 14;
+	if (!IsVaildConfig(Conf))
+		return STATUS_UNSUCCESSFUL;
 
 	RtlCopyMemory(RetConfig, Conf, sizeof(DISKFILTER_PROTECTION_CONFIG));
 	return STATUS_SUCCESS;
@@ -426,6 +384,13 @@ NTSTATUS InitVolumeLogicBitmap(PVOLUME_INFO volumeInfo)
 	}
 
 	// 以扇区为单位的位图
+	if (!NT_SUCCESS(DPBitmap_Create(&volumeInfo->BitmapRedirectUsed, volumeInfo->SectorCount, BITMAP_SLOT_SIZE)))
+	{
+		status = STATUS_UNSUCCESSFUL;
+		goto out;
+	}
+
+	// 以扇区为单位的位图
 	if (!NT_SUCCESS(DPBitmap_Create(&volumeInfo->BitmapAllow, volumeInfo->SectorCount, BITMAP_SLOT_SIZE)))
 	{
 		status = STATUS_UNSUCCESSFUL;
@@ -471,8 +436,11 @@ NTSTATUS InitVolumeLogicBitmap(PVOLUME_INFO volumeInfo)
 		}
 	}
 
-	// 初始化clusterMap
+	// 初始化重定向列表
 	RtlInitializeGenericTable(&volumeInfo->RedirectMap, CompareRoutine, AllocateRoutine, FreeRoutine, NULL);
+
+	// 初始化反向重定向列表
+	RtlInitializeGenericTable(&volumeInfo->ReverseRedirectMap, CompareRoutine, AllocateRoutine, FreeRoutine, NULL);
 
 	status = STATUS_SUCCESS;
 
@@ -657,8 +625,8 @@ void InitProtectVolumes()
 {
 	for (UCHAR i = 0; i < Config.ProtectVolumeCount; i++)
 	{
-		USHORT DiskNum = Config.ProtectVolume[i] & 0xFFFF;
-		USHORT PartitionNum = (Config.ProtectVolume[i] >> 16) & 0xFFFF;
+		USHORT DiskNum = DISKFILTER_DISKNUM_FROM_VOLNUM(Config.ProtectVolume[i]);
+		USHORT PartitionNum = DISKFILTER_PARTNUM_FROM_VOLNUM(Config.ProtectVolume[i]);
 		LogInfo("Protected volume: disk %hu partition %hu\n", DiskNum, PartitionNum);
 
 		PVOLUME_INFO VolInfo = FindProtectVolume(DiskNum, PartitionNum);
@@ -1200,12 +1168,18 @@ ULONGLONG GetRealSectorForWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex)
 			// 标记此扇区已被重定向(orgIndex)
 			DPBitmap_Set(volumeInfo->BitmapRedirect, orgIndex, TRUE);
 
+			// 标记被重定向使用的扇区
+			DPBitmap_Set(volumeInfo->BitmapRedirectUsed, mapIndex, TRUE);
+
 			// 加入重定向列表
 			{
 				REDIRECT_INFO	pair;
 				pair.OriginalIndex = orgIndex;
 				pair.MappedIndex = mapIndex;
 				RtlInsertElementGenericTable(&volumeInfo->RedirectMap, &pair, sizeof(REDIRECT_INFO), NULL);
+				pair.OriginalIndex = mapIndex;
+				pair.MappedIndex = orgIndex;
+				RtlInsertElementGenericTable(&volumeInfo->ReverseRedirectMap, &pair, sizeof(REDIRECT_INFO), NULL);
 			}
 		}
 	}
@@ -1304,6 +1278,223 @@ NTSTATUS HandleDiskRequest(
 		buff = (char *)buff + bytesPerSector;
 		length -= bytesPerSector;
 	}
+
+	return status;
+}
+
+// 直接写入时获取真实需要写入的扇区
+ULONGLONG GetRealSectorForDirectWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex)
+{
+	ULONGLONG	mapIndex = (ULONGLONG)-1;
+
+	// 此扇区是否允许直接写
+	if (IsSectorAllow(volumeInfo, orgIndex))
+	{
+		return -1;
+	}
+
+	// 此扇区是否是空闲扇区
+	if (!DPBitmap_Test(volumeInfo->BitmapUsed, orgIndex))
+	{
+		// 标记为非空闲
+		DPBitmap_Set(volumeInfo->BitmapUsed, orgIndex, TRUE);
+		// 加入反向重定向列表
+		{
+			REDIRECT_INFO	pair;
+			pair.OriginalIndex = orgIndex;
+			pair.MappedIndex = -1;
+			RtlInsertElementGenericTable(&volumeInfo->ReverseRedirectMap, &pair, sizeof(REDIRECT_INFO), NULL);
+			DPBitmap_Set(volumeInfo->BitmapRedirectUsed, orgIndex, TRUE);
+		}
+		return -1;
+	}
+
+	// 此扇区是否被重定向使用
+	if (DPBitmap_Test(volumeInfo->BitmapRedirectUsed, orgIndex))
+	{
+		PREDIRECT_INFO	result;
+		REDIRECT_INFO	pair;
+		pair.OriginalIndex = orgIndex;
+		result = (PREDIRECT_INFO)RtlLookupElementGenericTable(&volumeInfo->ReverseRedirectMap, &pair);
+		if (result)
+		{
+			ULONGLONG oldSector = result->MappedIndex; // 原扇区
+			if (oldSector == -1) // 之前是空闲状态，无需处理
+			{
+				return -1;
+			}
+			// 查找下一个可用的空闲扇区
+			mapIndex = DPBitmap_FindNext(volumeInfo->BitmapUsed, volumeInfo->LastScanIndex, FALSE);
+
+			if (mapIndex != -1)
+			{
+				// lastScan = 当前用到的 + 1
+				volumeInfo->LastScanIndex = mapIndex + 1;
+
+				// 标记为非空闲
+				DPBitmap_Set(volumeInfo->BitmapUsed, mapIndex, TRUE);
+
+				// 标记重定向使用的扇区
+				DPBitmap_Set(volumeInfo->BitmapRedirectUsed, mapIndex, TRUE);
+
+				// 删除原有重定向记录
+				pair.OriginalIndex = oldSector;
+				RtlDeleteElementGenericTable(&volumeInfo->RedirectMap, &pair);
+				pair.OriginalIndex = orgIndex;
+				RtlDeleteElementGenericTable(&volumeInfo->ReverseRedirectMap, &pair);
+				DPBitmap_Set(volumeInfo->BitmapRedirectUsed, orgIndex, FALSE);
+
+				// 加入重定向列表和反向重定向列表
+				{
+					REDIRECT_INFO	pair;
+					pair.OriginalIndex = oldSector;
+					pair.MappedIndex = mapIndex;
+					RtlInsertElementGenericTable(&volumeInfo->RedirectMap, &pair, sizeof(REDIRECT_INFO), NULL);
+					pair.OriginalIndex = mapIndex;
+					pair.MappedIndex = oldSector;
+					RtlInsertElementGenericTable(&volumeInfo->ReverseRedirectMap, &pair, sizeof(REDIRECT_INFO), NULL);
+				}
+			}
+		}
+	}
+	// 否则，此扇区是原来就使用的扇区，如果还没有被重定向，那么就进行重定向
+	else if (!DPBitmap_Test(volumeInfo->BitmapRedirect, orgIndex))
+	{
+		mapIndex = GetRealSectorForWrite(volumeInfo, orgIndex);
+	}
+
+	return mapIndex;
+}
+
+// 准备对硬盘的直接写操作
+NTSTATUS PrepareForDirectWriteRequest(
+	PVOLUME_INFO volumeInfo,
+	ULONGLONG logicOffset,
+	ULONG length)
+{
+	NTSTATUS status;
+
+	// 当前操作的物理偏移
+	ULONGLONG	physicalOffset = 0;
+	ULONGLONG	sectorIndex;
+	ULONGLONG	realIndex;
+	ULONG		bytesPerSector = volumeInfo->BytesPerSector;
+
+	// 以下几个参数为判断为处理的扇区是连续的扇区而设
+	BOOLEAN		isFirstBlock = TRUE;
+	ULONGLONG	prevIndex = (ULONGLONG)-1;
+	ULONGLONG	prevOffset = (ULONGLONG)-1;
+	PVOID		prevBuffer = NULL;
+	ULONG		totalProcessBytes = 0;
+
+	void * buff_mem;
+	void * buff;
+
+	buff_mem = __malloc(length);
+	if (!buff_mem)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	buff = buff_mem;
+
+	status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_READ, volumeInfo->StartOffset + logicOffset, buff, length, TRUE);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	// 判断上次要处理的扇区跟这次要处理的扇区是否连续，连续了就一起处理，否则单独处理, 加快速度
+	while (length)
+	{
+		sectorIndex = logicOffset / bytesPerSector;
+
+		realIndex = GetRealSectorForDirectWrite(volumeInfo, sectorIndex);
+
+		if (-1 == realIndex) // 返回-1表示不需要对这个扇区处理，直接跳过
+		{
+			// 既然要跳过这个扇区，那么上次要处理的扇区跟下次要处理的扇区就一定不连续
+			if (!isFirstBlock)
+			{
+				isFirstBlock = TRUE;
+				status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_WRITE, volumeInfo->StartOffset + prevOffset,
+					prevBuffer, totalProcessBytes, TRUE);
+			}
+
+			if (bytesPerSector >= length)
+				break;
+
+			logicOffset += (ULONGLONG)bytesPerSector;
+			buff = (char *)buff + bytesPerSector;
+			length -= bytesPerSector;
+			continue;
+		}
+
+		physicalOffset = realIndex * bytesPerSector;
+
+	__reInit:
+		// 初始prevIndex
+		if (isFirstBlock)
+		{
+			prevIndex = realIndex;
+			prevOffset = physicalOffset;
+			prevBuffer = buff;
+			totalProcessBytes = bytesPerSector;
+
+			isFirstBlock = FALSE;
+
+			goto __next;
+		}
+
+		// 测试是否连继,  如果连续，跳到下个判断
+		if (realIndex == prevIndex + 1)
+		{
+			prevIndex = realIndex;
+			totalProcessBytes += bytesPerSector;
+			goto __next;
+		}
+		// 处理上次连续需要处理的簇, 重置isFirstBlock
+		else
+		{
+			isFirstBlock = TRUE;
+			status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_WRITE, volumeInfo->StartOffset + prevOffset,
+				prevBuffer, totalProcessBytes, TRUE);
+
+			// 重新初始化
+			goto __reInit;
+		}
+	__next:
+		// 最后一个扇区
+		if (bytesPerSector >= length)
+		{
+			status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_WRITE, volumeInfo->StartOffset + prevOffset,
+				prevBuffer, totalProcessBytes, TRUE);
+
+			// 中断退出
+			break;
+		}
+
+		// 跳到下一个扇区, 处理剩余的数据
+		logicOffset += (ULONGLONG)bytesPerSector;
+		buff = (char *)buff + bytesPerSector;
+		length -= bytesPerSector;
+	}
+	__free(buff_mem);
+	return status;
+}
+
+// 处理对硬盘的直接读写操作
+NTSTATUS HandleDirectDiskRequest(
+	PVOLUME_INFO volumeInfo,
+	ULONG majorFunction,
+	ULONGLONG logicOffset,
+	void * buff,
+	ULONG length)
+{
+	NTSTATUS	status;
+
+	// 只处理对硬盘直接写的操作
+	if (IRP_MJ_WRITE == majorFunction)
+	{
+		status = PrepareForDirectWriteRequest(volumeInfo, logicOffset, length);
+	}
+	status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], majorFunction, volumeInfo->StartOffset + logicOffset, buff, length, TRUE);
 
 	return status;
 }
@@ -1424,15 +1615,23 @@ void ThreadReadWrite(PVOID Context)
 			{
 				if (IRP_MJ_READ == io_stack->MajorFunction)
 				{
-					status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
-						newbuff, length);
+					if (IsDirectDiskDevice(io_stack->DeviceObject))
+						status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
+							newbuff, length);
+					else
+						status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
+							newbuff, length);
 					RtlCopyMemory(buffer, newbuff, length);
 				}
 				else
 				{
 					RtlCopyMemory(newbuff, buffer, length);
-					status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
-						newbuff, length);
+					if (IsDirectDiskDevice(io_stack->DeviceObject))
+						status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
+							newbuff, length);
+					else
+						status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
+							newbuff, length);
 				}
 				__free(newbuff);
 			}
@@ -1456,8 +1655,17 @@ void ThreadReadWrite(PVOID Context)
 			continue;
 		// 处理请求失败，将请求直接交给下层设备处理
 		__failed:
-			IoSkipCurrentIrpStackLocation(Irp);
-			IoCallDriver(LowerDeviceObject[volume_info->DiskNumber], Irp);
+			if (IsDirectDiskDevice(io_stack->DeviceObject))
+			{
+				Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+				Irp->IoStatus.Information = 0;
+				IoCompleteRequest(Irp, IO_NO_INCREMENT);
+			}
+			else
+			{
+				IoSkipCurrentIrpStackLocation(Irp);
+				IoCallDriver(LowerDeviceObject[volume_info->DiskNumber], Irp);
+			}
 			continue;
 		}
 	}
@@ -1613,6 +1821,7 @@ OnDiskFilterDeviceControl(
 	case IOCTL_DISK_CREATE_DISK:
 	case IOCTL_DISK_FORMAT_TRACKS:
 	case IOCTL_DISK_FORMAT_TRACKS_EX:
+	case IOCTL_DISK_VERIFY:
 	case IOCTL_DISK_REASSIGN_BLOCKS:
 	case IOCTL_DISK_REASSIGN_BLOCKS_EX:
 	case IOCTL_STORAGE_FIRMWARE_DOWNLOAD:
@@ -1646,6 +1855,7 @@ OnDiskFilterDispatchControl(
 		ULONG OutBufferLength = StackLocation->Parameters.DeviceIoControl.OutputBufferLength;
 		ULONG ControlCode = StackLocation->Parameters.DeviceIoControl.IoControlCode;
 
+		*Status = STATUS_INVALID_DEVICE_REQUEST;
 		switch (ControlCode)
 		{
 		case DISKFILTER_IOCTL_DRIVER_CONTROL:
@@ -1655,19 +1865,54 @@ OnDiskFilterDispatchControl(
 				PDISKFILTER_CONTROL Data = (PDISKFILTER_CONTROL)SystemBuffer;
 				if (RtlEqualMemory(Data->AuthorizationContext, DiskFilter_AuthorizationContext, 128))
 				{
-					if (Data->ControlCode == DISKFILTER_CONTROL_TEST)
+					if (Data->ControlCode == DISKFILTER_CONTROL_GET_BUFFER_STATUS)
 					{
-						*Status = STATUS_SUCCESS;
+						if (OutBufferLength >= sizeof(DISKFILTER_BUFFER_STATUS))
+						{
+							UINT VolNum = *(UINT *)Data->Password;
+							USHORT DiskNum = DISKFILTER_DISKNUM_FROM_VOLNUM(VolNum);
+							USHORT PartNum = DISKFILTER_PARTNUM_FROM_VOLNUM(VolNum);
+							PVOLUME_INFO Volume = FindProtectVolume(DiskNum, PartNum);
+							if (Volume != NULL)
+							{
+								ULONGLONG SectorUsed = DPBitmap_Count(Volume->BitmapRedirectUsed, TRUE);
+								ULONGLONG SectorFree = DPBitmap_Count(Volume->BitmapUsed, FALSE);
+								DISKFILTER_BUFFER_STATUS BufferStatus;
+								BufferStatus.BytesVolumeTotal = Volume->BytesTotal;
+								BufferStatus.BytesBufferTotal = (SectorUsed + SectorFree) * Volume->BytesPerSector;
+								BufferStatus.BytesUsed = SectorUsed * Volume->BytesPerSector;
+								BufferStatus.BytesFree = SectorFree * Volume->BytesPerSector;
+								RtlCopyMemory(SystemBuffer, &BufferStatus, sizeof(BufferStatus));
+								info = sizeof(BufferStatus);
+								*Status = STATUS_SUCCESS;
+							}
+							else
+							{
+								*Status = STATUS_NOT_FOUND;
+							}
+						}
+						else
+						{
+							*Status = STATUS_BUFFER_TOO_SMALL;
+						}
 						break;
 					}
 					Data->Password[sizeof(Data->Password) - 1] = L'\0';
 					UCHAR Password[32];
 					RtlZeroMemory(Password, 32);
 					SHA256(Data->Password, wcslen(Data->Password) * sizeof(WCHAR), Password);
-					if (!RtlEqualMemory(Password, Config.Password, 32))
+					BOOL NewConfigVaild = (NewConfig.Magic == DISKFILTER_CONFIG_MAGIC && NewConfig.Version == DISKFILTER_DRIVER_VERSION);
+					BOOL CurConfigVaild = (Config.Magic == DISKFILTER_CONFIG_MAGIC && Config.Version == DISKFILTER_DRIVER_VERSION);
+					if (!NewConfigVaild && !CurConfigVaild)
+					{
+						*Status = STATUS_UNSUCCESSFUL;
+						break;
+					}
+					if ((NewConfigVaild && !RtlEqualMemory(Password, NewConfig.Password, 32)) || (!NewConfigVaild && CurConfigVaild && !RtlEqualMemory(Password, Config.Password, 32)))
 					{
 						*Status = STATUS_ACCESS_DENIED;
-						LogErrorMessageWithString(FilterDevice, MSG_FAILED_LOGIN_ATTEMPT, Data->Password, wcslen(Data->Password));
+						if (IsProtect)
+							LogErrorMessageWithString(FilterDevice, MSG_FAILED_LOGIN_ATTEMPT, Data->Password, wcslen(Data->Password));
 						break;
 					}
 					switch (Data->ControlCode)
@@ -1685,15 +1930,33 @@ OnDiskFilterDispatchControl(
 						}
 						break;
 					case DISKFILTER_CONTROL_SETCONFIG:
+					{
 						RtlCopyMemory(&NewConfig, &Data->Config, sizeof(NewConfig));
+						if (IsVaildConfig(&NewConfig))
+						{
+							UCHAR Mask = PROTECTION_ALLOW_DRIVER_LOAD | PROTECTION_DRIVER_WHITELIST | PROTECTION_DRIVER_BLACKLIST;
+							UCHAR NewFlags = (Config.ProtectionFlags & ~Mask) | (NewConfig.ProtectionFlags & Mask);
+							InterlockedExchange8((PCHAR)&Config.ProtectionFlags, NewFlags);
+							ExAcquireResourceExclusiveLite(&DriverListLock, TRUE);
+							InterlockedExchange8((PCHAR)&Config.DriverCount, NewConfig.DriverCount);
+							RtlCopyMemory(Config.DriverList, NewConfig.DriverList, sizeof(Config.DriverList));
+							ExReleaseResourceLite(&DriverListLock);
+						}
 						*Status = WriteProtectionConfig(&NewConfig);
 						break;
+					}
 					case DISKFILTER_CONTROL_GETSTATUS:
 						if (OutBufferLength >= sizeof(DISKFILTER_STATUS))
 						{
 							DISKFILTER_STATUS CurStatus;
+							RtlZeroMemory(&CurStatus, sizeof(CurStatus));
 							CurStatus.AllowDriverLoad = AllowLoadDriver;
 							CurStatus.ProtectEnabled = IsProtect;
+							CurStatus.ProtectVolumeCount = VaildVolumeCount;
+							for (UCHAR i = 0; i < VaildVolumeCount; i++)
+							{
+								CurStatus.ProtectVolume[i] = DISKFILTER_MAKE_VOLNUM(ProtectVolumeList[i].DiskNumber, ProtectVolumeList[i].PartitionNumber);
+							}
 							RtlCopyMemory(SystemBuffer, &CurStatus, sizeof(CurStatus));
 							info = sizeof(CurStatus);
 							*Status = STATUS_SUCCESS;
@@ -1710,6 +1973,69 @@ OnDiskFilterDispatchControl(
 					case DISKFILTER_CONTROL_DENY_DRIVER_LOAD:
 						InterlockedExchange8((PCHAR)&AllowLoadDriver, FALSE);
 						*Status = STATUS_SUCCESS;
+						break;
+					case DISKFILTER_CONTROL_MOUNT_DIRECT_DISK:
+					{
+						DISKFILTER_DIRECTDISK DirectDiskInfo;
+						RtlCopyMemory(&DirectDiskInfo, &Data->Config, sizeof(DirectDiskInfo));
+						if (FindDirectDiskDeviceByPartition(FilterDevice->DriverObject, DirectDiskInfo.DiskNumber, DirectDiskInfo.PartitionNumber))
+						{
+							*Status = STATUS_OBJECT_NAME_COLLISION;
+							break;
+						}
+						PVOLUME_INFO ProtectedVolume = FindProtectVolume(DirectDiskInfo.DiskNumber, DirectDiskInfo.PartitionNumber);
+						if (ProtectedVolume == NULL)
+						{
+							*Status = STATUS_NOT_FOUND;
+							break;
+						}
+						*Status = DirectDiskMount(FilterDevice->DriverObject, DirectDiskCount, DirectDiskInfo.DriveLetter, ProtectedVolume, DirectDiskInfo.ReadOnly);
+						if (NT_SUCCESS(*Status))
+							InterlockedIncrement((PLONG)&DirectDiskCount);
+						break;
+					}
+					case DISKFILTER_CONTROL_UNMOUNT_DIRECT_DISK:
+					{
+						ULONG Number;
+						RtlCopyMemory(&Number, &Data->Config, sizeof(Number));
+						PDEVICE_OBJECT DirectDiskDev = FindDirectDiskDevice(FilterDevice->DriverObject, Number);
+						if (DirectDiskDev == NULL)
+						{
+							*Status = STATUS_NOT_FOUND;
+							break;
+						}
+						*Status = DirectDiskUnmount(DirectDiskDev);
+						break;
+					}
+					case DISKFILTER_CONTROL_GET_DIRECTDISK_STATUS:
+						if (OutBufferLength >= sizeof(DISKFILTER_DIRECTDISK_STATUS))
+						{
+							DISKFILTER_DIRECTDISK_STATUS CurStatus;
+							RtlZeroMemory(&CurStatus, sizeof(CurStatus));
+							PDEVICE_OBJECT DeviceObject;
+							ULONG TotalCount = 0;
+							DeviceObject = FilterDevice->DriverObject->DeviceObject;
+							while (DeviceObject)
+							{
+								if (IsDirectDiskDevice(DeviceObject))
+								{
+									if (TotalCount < sizeof(CurStatus.MountVolume) / sizeof(*CurStatus.MountVolume))
+									{
+										DirectDiskGetConfig(DeviceObject, &CurStatus.MountVolume[TotalCount]);
+										TotalCount++;
+									}
+								}
+								DeviceObject = DeviceObject->NextDevice;
+							}
+							CurStatus.MountVolumeCount = TotalCount;
+							RtlCopyMemory(SystemBuffer, &CurStatus, sizeof(CurStatus));
+							info = sizeof(CurStatus);
+							*Status = STATUS_SUCCESS;
+						}
+						else
+						{
+							*Status = STATUS_BUFFER_TOO_SMALL;
+						}
 						break;
 					default:
 						break;
@@ -1762,12 +2088,15 @@ void LoadDriverNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_IN
 	{
 		UINT *hash = (UINT*)ImageHash;
 		LogInfo("File %wZ Hash %.8X%.8X%.8X%.8X%.8X%.8X%.8X%.8X\n", FullImageName, hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]);
-		if ((Config.ProtectionFlags & PROTECTION_DRIVER_WHITELIST) && IsHashInList(Config.DriverList, Config.DriverCount, ImageHash))
+		ExAcquireResourceSharedLite(&DriverListLock, TRUE);
+		BOOL HashInList = IsHashInList(Config.DriverList, Config.DriverCount, ImageHash);
+		ExReleaseResourceLite(&DriverListLock);
+		if ((Config.ProtectionFlags & PROTECTION_DRIVER_WHITELIST) && HashInList)
 		{
 			LogInfo("In white list\n");
 			return;
 		}
-		else if ((Config.ProtectionFlags & PROTECTION_DRIVER_BLACKLIST) && !IsHashInList(Config.DriverList, Config.DriverCount, ImageHash))
+		else if ((Config.ProtectionFlags & PROTECTION_DRIVER_BLACKLIST) && !HashInList)
 		{
 			LogInfo("Not in black list\n");
 			return;
@@ -1802,7 +2131,7 @@ void LoadDriverNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_IN
 	}
 }
 
-// 卸载驱动时被调用，驱动只有在遇到错误时才可以被卸载
+// 卸载驱动时被调用，由于是硬盘过滤驱动，此驱动不能被卸载
 VOID
 OnDiskFilterUnload(PDRIVER_OBJECT DriverObject)
 {
@@ -1815,9 +2144,8 @@ OnDiskFilterUnload(PDRIVER_OBJECT DriverObject)
 	if (FilterDevice)
 		IoDeleteDevice(FilterDevice);
 
-	ThawSpaceUnload(DriverObject);
-
 	LogInfo("Driver unloaded\n");
+	KeBugCheck(SYSTEM_SERVICE_EXCEPTION);
 }
 
 // 启动驱动加载完毕时被调用
@@ -1832,7 +2160,6 @@ void DriverReinit(PDRIVER_OBJECT DriverObject, PVOID Context, ULONG Count)
 	{
 		LogErr("Failed to read protection config file (%wZ) ! status=0x%.8X\n", &ConfigPath, status);
 		LogErrorMessageWithString(FilterDevice, MSG_FAILED_TO_LOAD_CONFIG, ConfigPath.Buffer, ConfigPath.Length);
-		DriverObject->DriverUnload = OnDiskFilterUnload;
 		return;
 	}
 	RtlCopyMemory(&NewConfig, &Config, sizeof(Config));
@@ -1882,6 +2209,8 @@ void DriverReinit(PDRIVER_OBJECT DriverObject, PVOID Context, ULONG Count)
 
 	InitThawSpace();
 
+	DirectDiskInit(DriverObject);
+
 	PsSetLoadImageNotifyRoutine(&LoadDriverNotify);
 
 	LogInfo("Initialize success\n");
@@ -1899,18 +2228,23 @@ OnDiskFilterInitialization(
 	PDEVICE_OBJECT		deviceObject = NULL;
 	UNICODE_STRING		ntDeviceName;
 	UNICODE_STRING		dosDeviceName;
+	UNICODE_STRING		sddl;
 
 	LogInfo("Driver loaded\n");
 
 	RtlInitUnicodeString(&ntDeviceName, DISKFILTER_DEVICE_NAME_W);
 
-	status = IoCreateDevice(
+	RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+
+	status = IoCreateDeviceSecure(
 		DriverObject,
 		0,								// DeviceExtensionSize
 		&ntDeviceName,					// DeviceName
 		FILE_DEVICE_DISKFLT,			// DeviceType
 		0,								// DeviceCharacteristics
 		TRUE,							// Exclusive
+		&sddl,							// DefaultSDDLString
+		NULL,							// DeviceClassGuid
 		&deviceObject					// [OUT]
 	);
 
@@ -1938,6 +2272,7 @@ OnDiskFilterInitialization(
 	memset(LowerDeviceObject, 0, sizeof(LowerDeviceObject));
 	memset(&Config, 0, sizeof(Config));
 	memset(&NewConfig, 0, sizeof(NewConfig));
+	ExInitializeResourceLite(&DriverListLock);
 	memset(ProtectVolumeList, 0, sizeof(ProtectVolumeList));
 	memset(VolumeList, 0, sizeof(VolumeList));
 	VaildVolumeCount = 0;
@@ -1945,6 +2280,7 @@ OnDiskFilterInitialization(
 	ConfigVcnPairs = NULL;
 	IsProtect = FALSE;
 	AllowLoadDriver = TRUE;
+	DirectDiskCount = 0;
 
 	WCHAR strAppend[] = L"\\Parameters";
 	ULONG TotalLen = RegistryPath->Length / 2 + wcslen(strAppend) + 10;
@@ -1990,7 +2326,6 @@ OnDiskFilterInitialization(
 		return deviceObject;
 
 failed:
-	DriverObject->DriverUnload = OnDiskFilterUnload;
 	IoDeleteSymbolicLink(&dosDeviceName);
 
 	if (deviceObject)

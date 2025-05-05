@@ -4,13 +4,11 @@
 void DPBitmap_Free(DP_BITMAP *bitmap)
 {
 	//释放bitmap
-	ULONG i = 0;
-
 	if (NULL != bitmap)
 	{
 		if (NULL != bitmap->buffer)
 		{
-			for (i = 0; i < bitmap->regionNumber; i++)
+			for (ULONG i = 0; i < bitmap->regionNumber; i++)
 			{
 				if (NULL != bitmap->buffer[i])
 				{
@@ -26,7 +24,7 @@ void DPBitmap_Free(DP_BITMAP *bitmap)
 	}
 }
 
-NTSTATUS DPBitmap_Create(DP_BITMAP **bitmap, ULONGLONG bitMapSize, ULONGLONG regionBytes)
+NTSTATUS DPBitmap_Create(DP_BITMAP **bitmap, ULONGLONG bitMapSize, ULONG regionBytes)
 {
 	NTSTATUS status = STATUS_UNSUCCESSFUL;
 	DP_BITMAP *myBitmap = NULL;
@@ -48,14 +46,15 @@ NTSTATUS DPBitmap_Create(DP_BITMAP **bitmap, ULONGLONG bitMapSize, ULONGLONG reg
 		//清空结构
 		memset(myBitmap, 0, sizeof(DP_BITMAP));
 
-		myBitmap->regionSize = (ULONG)(regionBytes * 8);
+		myBitmap->regionSize = regionBytes * 8;
 		if (myBitmap->regionSize > bitMapSize)
 		{
 			myBitmap->regionSize = (ULONG)(bitMapSize / 2);
 		}
 		//根据参数对结构中的成员进行赋值
-		myBitmap->bitMapSize = (ULONG)bitMapSize;
-		myBitmap->regionBytes = (myBitmap->regionSize / 8) + sizeof(int);
+		myBitmap->bitMapSize = bitMapSize;
+		myBitmap->bitMapUsed = 0;
+		myBitmap->regionBytes = regionBytes + sizeof(int);
 
 		myBitmap->regionNumber = (ULONG)(bitMapSize / myBitmap->regionSize);
 		if (bitMapSize % myBitmap->regionSize)
@@ -90,7 +89,7 @@ NTSTATUS DPBitmap_Create(DP_BITMAP **bitmap, ULONGLONG bitMapSize, ULONGLONG reg
 
 ULONGLONG DPBitmap_FindNext(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 {
-	LONG	jmpValue = set ? 0 : 0xFFFFFFFF;
+	ULONG	jmpValue = set ? 0 : 0xFFFFFFFF;
 	ULONG	slot = 0;
 
 	// 遍历slot
@@ -103,7 +102,7 @@ ULONGLONG DPBitmap_FindNext(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 		{
 			if (set)
 			{
-				startIndex = (slot + 1) * bitMap->regionSize;
+				startIndex = (slot + 1) * (ULONGLONG)bitMap->regionSize;
 				continue;
 			}
 			else
@@ -112,7 +111,7 @@ ULONGLONG DPBitmap_FindNext(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 			}
 		}
 
-		for (max = min((slot + 1) * bitMap->regionSize, bitMap->bitMapSize);
+		for (max = min((slot + 1) * (ULONGLONG)bitMap->regionSize, bitMap->bitMapSize);
 			startIndex < max; )
 		{
 			ULONG	sIndex = startIndex % bitMap->regionSize;
@@ -140,7 +139,7 @@ ULONGLONG DPBitmap_FindNext(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 
 ULONGLONG DPBitmap_FindPrev(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 {
-	LONG	jmpValue = set ? 0 : 0xFFFFFFFF;
+	ULONG	jmpValue = set ? 0 : 0xFFFFFFFF;
 	ULONG	slot = 0;
 
 	// 遍历slot
@@ -156,7 +155,7 @@ ULONGLONG DPBitmap_FindPrev(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 				if (slot == 0)
 					break;
 
-				startIndex = slot * bitMap->regionSize - 1;
+				startIndex = slot * (ULONGLONG)bitMap->regionSize - 1;
 				continue;
 			}
 			else
@@ -165,7 +164,7 @@ ULONGLONG DPBitmap_FindPrev(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 			}
 		}
 
-		for (mn = slot * bitMap->regionSize;
+		for (mn = slot * (ULONGLONG)bitMap->regionSize;
 			startIndex >= mn; )
 		{
 			ULONG	sIndex = startIndex % bitMap->regionSize;
@@ -227,9 +226,21 @@ NTSTATUS DPBitmap_Set(DP_BITMAP *bitMap, ULONGLONG index, BOOL set)
 	index %= bitMap->regionSize;
 
 	if (set)
-		((ULONG *)bitMap->buffer[slot])[index / 32] |= (1 << (index % 32));
+	{
+		if (!(((ULONG *)bitMap->buffer[slot])[index / 32] & (1 << (index % 32))))
+		{
+			((ULONG *)bitMap->buffer[slot])[index / 32] |= (1 << (index % 32));
+			InterlockedIncrement64((LONGLONG *)&bitMap->bitMapUsed);
+		}
+	}
 	else
-		((ULONG *)bitMap->buffer[slot])[index / 32] &= ~(1 << (index % 32));
+	{
+		if (((ULONG *)bitMap->buffer[slot])[index / 32] & (1 << (index % 32)))
+		{
+			((ULONG *)bitMap->buffer[slot])[index / 32] &= ~(1 << (index % 32));
+			InterlockedDecrement64((LONGLONG *)&bitMap->bitMapUsed);
+		}
+	}
 
 	return STATUS_SUCCESS;
 }
@@ -239,7 +250,7 @@ BOOL DPBitmap_Test(DP_BITMAP *bitMap, ULONGLONG index)
 	ULONG	slot = (ULONG)(index / bitMap->regionSize);
 	if (slot > (bitMap->regionNumber - 1))
 	{
-		LogWarn("DPBitMap_Test out of range slot %d\n", slot);
+		LogWarn("DPBitmap_Test out of range slot %d\n", slot);
 		return FALSE;
 	}
 	// 还没分配
@@ -251,4 +262,11 @@ BOOL DPBitmap_Test(DP_BITMAP *bitMap, ULONGLONG index)
 	index %= bitMap->regionSize;
 
 	return (((ULONG *)bitMap->buffer[slot])[index / 32] & (1 << (index % 32)) ? TRUE : FALSE);
+}
+
+ULONGLONG DPBitmap_Count(DP_BITMAP *bitMap, BOOL set)
+{
+	if (!set)
+		return bitMap->bitMapSize - bitMap->bitMapUsed;
+	return bitMap->bitMapUsed;
 }
