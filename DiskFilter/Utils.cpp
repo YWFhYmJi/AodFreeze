@@ -790,6 +790,13 @@ NT Status is returned.
 
 	UNREFERENCED_PARAMETER(DeviceObject);
 
+	if (!NT_SUCCESS(Irp->IoStatus.Status))
+	{
+		PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+		LogErr("Disk IO error! DeviceObject=%p, MajorFunction=%d, Offset=%llu, Length=%u, Status=0x%.8X\n",
+			DeviceObject, irpStack->MajorFunction, irpStack->Parameters.Read.ByteOffset.QuadPart, irpStack->Parameters.Read.Length, Irp->IoStatus.Status);
+	}
+
 	// 
 	// Free resources 
 	// 
@@ -797,6 +804,7 @@ NT Status is returned.
 	if (Irp->AssociatedIrp.SystemBuffer && (Irp->Flags & IRP_DEALLOCATE_BUFFER)) {
 		__free(Irp->AssociatedIrp.SystemBuffer);
 	}
+
 	/*
 	因为这个 IRP 就是在我这层次建立的，上层本就不知道有这么一个 IRP。
 	那么到这里我就要在 CompleteRoutine 中使用 IoFreeIrp()来释放掉这个 IRP，
@@ -1197,16 +1205,6 @@ NTSTATUS UnmountVolume(WCHAR VolumeLetter)
 }
 
 #pragma pack(push, 1)
-// Starting at offset 36 into the BPB, this is the structure for a FAT12/16 FS
-typedef struct _BPBFAT1216_struct {
-	unsigned char     BS_DriveNumber;           // 1
-	unsigned char     BS_Reserved1;             // 1
-	unsigned char     BS_BootSig;               // 1
-	unsigned int      BS_VolumeID;              // 4
-	char     BS_VolumeLabel[11];       // 11
-	char     BS_FileSystemType[8];     // 8
-} BPB1216_struct;
-
 // Starting at offset 36 into the BPB, this is the structure for a FAT32 FS
 typedef struct _BPBFAT32_struct {
 	unsigned int      FATSize;             // 4
@@ -1239,10 +1237,7 @@ typedef struct _BPB_struct {
 	unsigned short    NumberOfHeads;         // 2
 	unsigned int      HiddenSectors;         // 4
 	unsigned int      TotalSectors32;        // 4
-	union {
-		BPB1216_struct fat16;
-		BPB32_struct fat32;
-	} FSTypeSpecificData;
+	BPB32_struct fat32;
 } BPB_struct;
 #pragma pack(pop)
 
@@ -1251,7 +1246,7 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	UCHAR sectorBuf0[512];
 	UCHAR sectorBuf[512];
 	BPB_struct bpb;
-	UINT scl, val, ssa, fat;
+	UINT ssa;
 	IO_STATUS_BLOCK IoStatus = { 0 };
 	LARGE_INTEGER Offset = { 0 };
 
@@ -1283,27 +1278,27 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 
 	// BPB
 	bpb.BytesPerSector = 0x200;        // hard coded, must be a define somewhere
-	bpb.SectorsPerCluster = 32;        // this may change based on drive size
+	bpb.SectorsPerCluster = 8;         // this may change based on drive size
 	bpb.ReservedSectorCount = 32;
 	bpb.NumFATs = 2;
 	bpb.Media = 0xf8;
 	bpb.SectorsPerTrack = 32;          // unknown here
-	bpb.NumberOfHeads = 64;            // ?
+	bpb.NumberOfHeads = 2;             // ?
 	bpb.TotalSectors32 = FileSize / 0x200;
 	// BPB-FAT32 Extension
-	bpb.FSTypeSpecificData.fat32.FATSize = FileSize / 0x200 / 4095;
-	bpb.FSTypeSpecificData.fat32.RootCluster = 2;
-	bpb.FSTypeSpecificData.fat32.FSInfo = 1;
-	bpb.FSTypeSpecificData.fat32.BkBootSec = 6;
-	bpb.FSTypeSpecificData.fat32.BS_BootSig = 0x29;
-	bpb.FSTypeSpecificData.fat32.BS_VolumeID = 0xfbf4499b;      // hardcoded volume id.  this is weird.  should be generated each time.
-	memset(bpb.FSTypeSpecificData.fat32.BS_VolumeLabel, 0x20, 11);
-	memcpy(bpb.FSTypeSpecificData.fat32.BS_FileSystemType, "FAT32   ", 8);
+	UINT TmpVal2 = ((256 * bpb.SectorsPerCluster) + bpb.NumFATs) / 2;
+	bpb.fat32.FATSize = (bpb.TotalSectors32 - bpb.ReservedSectorCount + (TmpVal2 - 1)) / TmpVal2;
+	bpb.fat32.RootCluster = 2;
+	bpb.fat32.FSInfo = 1;
+	bpb.fat32.BkBootSec = 6;
+	bpb.fat32.BS_DriveNumber = 0x80;
+	bpb.fat32.BS_BootSig = 0x29;
+	bpb.fat32.BS_VolumeID = 0xfbf4499b;      // hardcoded volume id.  this is weird.  should be generated each time.
+	memcpy(bpb.fat32.BS_VolumeLabel, "NO NAME    ", 11);
+	memcpy(bpb.fat32.BS_FileSystemType, "FAT32   ", 8);
 	memcpy(sectorBuf0, &bpb, sizeof(bpb));
 
 	memcpy(sectorBuf0 + 0x5a, "\x0e\x1f\xbe\x77\x7c\xac\x22\xc0\x74\x0b\x56\xb4\x0e\xbb\x07\x00\xcd\x10\x5e\xeb\xf0\x32\xe4\xcd\x17\xcd\x19\xeb\xfeThis is not a bootable disk.  Please insert a bootable floppy and\r\npress any key to try again ... \r\n", 129);
-
-	fat = bpb.ReservedSectorCount;
 
 	// ending signatures
 	sectorBuf0[0x1fe] = 0x55;
@@ -1313,7 +1308,7 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	LogInfo("Write boot sector ok\n");
 
 	// set up key sectors...
-	ssa = (bpb.NumFATs * bpb.FSTypeSpecificData.fat32.FATSize) + fat;
+	ssa = bpb.ReservedSectorCount + (bpb.NumFATs * bpb.fat32.FATSize);
 	// FSInfo sector
 	memset(sectorBuf, 0x00, 0x200);
 	*((UINT*)sectorBuf) = 0x41615252;
@@ -1329,7 +1324,6 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
 	LogInfo("Write FSInfo sector ok\n");
 
-	fat = bpb.ReservedSectorCount;
 	// write backup copy of metadata
 	//write_sector(sectorBuf0, 6);
 	Offset.QuadPart = 6 * 512ull;
@@ -1338,9 +1332,11 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 
 	memset(sectorBuf, 0x00, 0x200);
 	*((UINT*)(sectorBuf + 0x000)) = 0x0ffffff8;   // special - EOF marker
-	*((UINT*)(sectorBuf + 0x004)) = 0x0fffffff;   // special and clean
-	*((UINT*)(sectorBuf + 0x008)) = 0x0ffffff8;   // root directory (one cluster)
-	Offset.QuadPart = bpb.SectorsPerCluster * 512ull;
+	*((UINT*)(sectorBuf + 0x004)) = 0xffffffff;   // special and clean
+	*((UINT*)(sectorBuf + 0x008)) = 0x0fffffff;   // root directory (one cluster)
+	Offset.QuadPart = bpb.ReservedSectorCount * 512ull;
+	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
+	Offset.QuadPart = (bpb.ReservedSectorCount + bpb.fat32.FATSize) * 512ull;
 	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
 	LogInfo("Write root directory ok\n");
 

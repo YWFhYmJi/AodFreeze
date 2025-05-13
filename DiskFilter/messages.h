@@ -195,3 +195,30 @@
 //
 #define MSG_PROTECT_VOLUME_LOAD_FAILED   ((NTSTATUS)0xC0070011L)
 
+//
+// MessageId: MSG_PROTECT_VOLUME_LOAD_OK
+//
+// MessageText:
+//
+// Protected volume %2 load success.
+//
+#define MSG_PROTECT_VOLUME_LOAD_OK       ((NTSTATUS)0x40070012L)
+
+//
+// MessageId: MSG_DIRECT_MOUNT_OK
+//
+// MessageText:
+//
+// Protected volume %2 mount success.
+//
+#define MSG_DIRECT_MOUNT_OK              ((NTSTATUS)0x40070013L)
+
+//
+// MessageId: MSG_DIRECT_UNMOUNT_OK
+//
+// MessageText:
+//
+// Protected volume %2 unmount success.
+//
+#define MSG_DIRECT_UNMOUNT_OK            ((NTSTATUS)0x40070014L)
+

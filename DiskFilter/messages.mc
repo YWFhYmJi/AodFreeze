@@ -150,3 +150,27 @@ SymbolicName=MSG_PROTECT_VOLUME_LOAD_FAILED
 Language=English
 Failed to load protected volume %2. Filter on this volume will be disabled.
 .
+
+MessageId=0x0012
+Facility=Driver
+Severity=Informational
+SymbolicName=MSG_PROTECT_VOLUME_LOAD_OK
+Language=English
+Protected volume %2 load success.
+.
+
+MessageId=0x0013
+Facility=Driver
+Severity=Informational
+SymbolicName=MSG_DIRECT_MOUNT_OK
+Language=English
+Protected volume %2 mount success.
+.
+
+MessageId=0x0014
+Facility=Driver
+Severity=Informational
+SymbolicName=MSG_DIRECT_UNMOUNT_OK
+Language=English
+Protected volume %2 unmount success.
+.

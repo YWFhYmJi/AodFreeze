@@ -200,6 +200,7 @@
     </Link>
     <ClCompile>
       <TreatWarningAsError>false</TreatWarningAsError>
+      <AdditionalOptions>/Gs1048576 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -216,6 +217,8 @@
     <ClCompile Include="IrpFile.cpp" />
     <ClCompile Include="mempool\malloc.c" />
     <ClCompile Include="mempool\mempool.c" />
+    <ClCompile Include="rbtree.c" />
+    <ClCompile Include="RedirectTable.cpp" />
     <ClCompile Include="ThawSpace.cpp" />
     <ClCompile Include="UsingCPP.cpp" />
     <ClCompile Include="Utils.cpp" />
@@ -231,6 +234,8 @@
     <ClInclude Include="mempool\mempool.h" />
     <ClInclude Include="Pch.h" />
     <ClInclude Include="Public.h" />
+    <ClInclude Include="rbtree.h" />
+    <ClInclude Include="RedirectTable.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="ThawSpace.h" />
     <ClInclude Include="UsingCPP.hpp" />

@@ -1,12 +1,13 @@
 #include "../Pch.h"
 
-//#define NO_MEMPOOL
-
+#ifdef DBG
+#define NO_MEMPOOL
 #undef DBG
+#endif
 
 #if DBG
 
-#define MAGIC	'TMEM'
+#define MAGIC	'TMFD'
 #define INT_3	//DbgBreakPoint()
 
 struct prefix {
@@ -224,7 +225,7 @@ mempool_malloc(size_t size)
 	}
 	return ptr;
 #else
-	return ExAllocatePoolWithTag(NonPagedPool, size, 'SmeM');
+	return ExAllocatePoolWithTag(NonPagedPool, size, 'SMFD');
 #endif
 }
 
@@ -239,7 +240,7 @@ void mempool_free(void * ptr)
 		KeReleaseSpinLock(&mp_spinlock__, irql);
 	}
 #else
-	ExFreePoolWithTag(ptr, 'SmeM');
+	ExFreePoolWithTag(ptr, 'SMFD');
 #endif
 }
 void mempool_fini()

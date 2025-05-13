@@ -542,7 +542,7 @@ MAX_RELEASE_CHECK_RATE   default: 4095 unless not HAVE_MMAP
 #endif
 
 #define USE_DL_PREFIX
-#define MEM_TAG		'PmeM'
+#define MEM_TAG		'PMFD'
 
 #undef DBG
 #include "../Pch.h"

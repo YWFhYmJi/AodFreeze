@@ -37,6 +37,7 @@ PVOLUME_INFO VolumeList[26]; // 盘符对应的保护卷
 UINT VaildVolumeCount; // 保护卷数量
 BOOLEAN IsProtect; // 是否在保护状态
 BOOLEAN AllowLoadDriver; // 是否允许加载驱动
+BOOLEAN AllowDirectMount; // 是否允许直接挂载
 UINT DirectDiskCount; // 已挂载的直接读写卷数量
 
 // 读写操作线程
@@ -314,44 +315,6 @@ NTSTATUS WriteProtectionConfig(PDISKFILTER_PROTECTION_CONFIG ConfigData)
 	return status;
 }
 
-// 重定向表相关函数
-RTL_GENERIC_COMPARE_RESULTS NTAPI CompareRoutine(
-	PRTL_GENERIC_TABLE Table,
-	PVOID FirstStruct,
-	PVOID SecondStruct
-)
-{
-	PREDIRECT_INFO first = (PREDIRECT_INFO)FirstStruct;
-	PREDIRECT_INFO second = (PREDIRECT_INFO)SecondStruct;
-
-	UNREFERENCED_PARAMETER(Table);
-
-	if (first->OriginalIndex < second->OriginalIndex)
-		return GenericLessThan;
-	else if (first->OriginalIndex > second->OriginalIndex)
-		return GenericGreaterThan;
-	else
-		return GenericEqual;
-}
-
-PVOID NTAPI AllocateRoutine(
-	PRTL_GENERIC_TABLE Table,
-	CLONG ByteSize
-)
-{
-	UNREFERENCED_PARAMETER(Table);
-	return __malloc(ByteSize);
-}
-
-void NTAPI FreeRoutine(
-	PRTL_GENERIC_TABLE Table,
-	PVOID Buffer
-)
-{
-	UNREFERENCED_PARAMETER(Table);
-	__free(Buffer);
-}
-
 // 初始化卷的位图信息
 NTSTATUS InitVolumeLogicBitmap(PVOLUME_INFO volumeInfo)
 {
@@ -415,7 +378,7 @@ NTSTATUS InitVolumeLogicBitmap(PVOLUME_INFO volumeInfo)
 
 	if (!NT_SUCCESS(status))
 	{
-		return status;
+		goto out;
 	}
 
 	// 初始化位图
@@ -427,9 +390,9 @@ NTSTATUS InitVolumeLogicBitmap(PVOLUME_INFO volumeInfo)
 			ULONGLONG base = volumeInfo->FirstDataSector + (i * SectorsPerCluster);
 			for (j = 0; j < SectorsPerCluster; j++)
 			{
-				if (!NT_SUCCESS(DPBitmap_Set(volumeInfo->BitmapUsed, base + j, TRUE)))
+				status = DPBitmap_Set(volumeInfo->BitmapUsed, base + j, TRUE);
+				if (!NT_SUCCESS(status))
 				{
-					status = STATUS_UNSUCCESSFUL;
 					goto out;
 				}
 			}
@@ -437,10 +400,13 @@ NTSTATUS InitVolumeLogicBitmap(PVOLUME_INFO volumeInfo)
 	}
 
 	// 初始化重定向列表
-	RtlInitializeGenericTable(&volumeInfo->RedirectMap, CompareRoutine, AllocateRoutine, FreeRoutine, NULL);
+	RedirectTable_Init(&volumeInfo->RedirectMap);
 
-	// 初始化反向重定向列表
-	RtlInitializeGenericTable(&volumeInfo->ReverseRedirectMap, CompareRoutine, AllocateRoutine, FreeRoutine, NULL);
+	if (AllowDirectMount)
+	{
+		// 初始化反向重定向列表
+		RedirectTable_Init(&volumeInfo->ReverseRedirectMap);
+	}
 
 	status = STATUS_SUCCESS;
 
@@ -448,21 +414,12 @@ out:
 
 	if (!NT_SUCCESS(status))
 	{
-		if (volumeInfo->BitmapRedirect)
-		{
-			DPBitmap_Free(volumeInfo->BitmapRedirect);
-			volumeInfo->BitmapRedirect = NULL;
-		}
-		if (volumeInfo->BitmapAllow)
-		{
-			DPBitmap_Free(volumeInfo->BitmapAllow);
-			volumeInfo->BitmapAllow = NULL;
-		}
-		if (volumeInfo->BitmapUsed)
-		{
-			DPBitmap_Free(volumeInfo->BitmapUsed);
-			volumeInfo->BitmapUsed = NULL;
-		}
+		DPBitmap_Free(volumeInfo->BitmapRedirect);
+		volumeInfo->BitmapRedirect = NULL;
+		DPBitmap_Free(volumeInfo->BitmapAllow);
+		volumeInfo->BitmapAllow = NULL;
+		DPBitmap_Free(volumeInfo->BitmapUsed);
+		volumeInfo->BitmapUsed = NULL;
 	}
 	if (Bitmap)
 		__free(Bitmap);
@@ -473,51 +430,44 @@ out:
 // 设置文件数据直接读写
 NTSTATUS SetDirectReadWriteFile(PVOLUME_INFO volume, PWCHAR path)
 {
-	NTSTATUS status;
-
-	HANDLE fileHandle = (HANDLE)-1;
-
-	ULONG   Cls, r, sectorsPerCluster;
-	LARGE_INTEGER PrevVCN, Lcn;
-	PRETRIEVAL_POINTERS_BUFFER pVcnPairs = NULL;
-	WCHAR tempBuffer[MAX_PATH];
-	UNICODE_STRING target;
-
 	if (volume == NULL)
 		return STATUS_UNSUCCESSFUL;
 
+	WCHAR tempBuffer[MAX_PATH];
 	swprintf_s(tempBuffer, MAX_PATH, L"\\Device\\Harddisk%d\\Partition%d%ls", volume->DiskNumber, volume->PartitionNumber, path);
+	UNICODE_STRING target;
 	RtlInitUnicodeString(&target, tempBuffer);
-	status = GetFileHandleReadOnly(&fileHandle, &target);
+	HANDLE fileHandle = (HANDLE)-1;
+	NTSTATUS status = GetFileHandleReadOnly(&fileHandle, &target);
 	if (!NT_SUCCESS(status))
 	{
 		goto out;
 	}
 
-	sectorsPerCluster = volume->BytesPerCluster / volume->BytesPerSector;
+	ULONG sectorsPerCluster = volume->BytesPerCluster / volume->BytesPerSector;
 
-	pVcnPairs = (PRETRIEVAL_POINTERS_BUFFER)GetFileClusterList(fileHandle);
+	PRETRIEVAL_POINTERS_BUFFER pVcnPairs = (PRETRIEVAL_POINTERS_BUFFER)GetFileClusterList(fileHandle);
 
 	if (!pVcnPairs || pVcnPairs->Extents[0].Lcn.QuadPart == -1) // 不支持被压缩的文件
 	{
+		LogInfo("Failed to get file cluster list, file compressed?\n");
 		status = STATUS_UNSUCCESSFUL;
 		goto out;
 	}
 
-	PrevVCN = pVcnPairs->StartingVcn;
-	for (r = 0, Cls = 0; r < pVcnPairs->ExtentCount; r++)
+	ULONGLONG PrevVCN = pVcnPairs->StartingVcn.QuadPart;
+	for (ULONG r = 0; r < pVcnPairs->ExtentCount; r++)
 	{
-		ULONG	CnCount;
-		Lcn = pVcnPairs->Extents[r].Lcn;
-		LONGLONG EndLcn = Lcn.QuadPart + pVcnPairs->Extents[r].NextVcn.QuadPart - PrevVCN.QuadPart - 1;
-		LogInfo("Cluster %lld -> %lld (Sector %lld -> %lld) is allowed to direct write.\n", Lcn.QuadPart, EndLcn, volume->FirstDataSector + Lcn.QuadPart * sectorsPerCluster, volume->FirstDataSector + EndLcn * sectorsPerCluster);
+		ULONGLONG NextVCN = pVcnPairs->Extents[r].NextVcn.QuadPart;
+		ULONG CnCount = (ULONG)(NextVCN - PrevVCN);
+		ULONGLONG Lcn = pVcnPairs->Extents[r].Lcn.QuadPart;
+		ULONGLONG EndLcn = Lcn + CnCount - 1;
+		LogInfo("Cluster %llu -> %llu (Sector %llu -> %llu) is allowed to direct write.\n", Lcn, EndLcn, volume->FirstDataSector + Lcn * sectorsPerCluster, volume->FirstDataSector + EndLcn * sectorsPerCluster);
 
-		for (CnCount = (ULONG)(pVcnPairs->Extents[r].NextVcn.QuadPart - PrevVCN.QuadPart);
-			CnCount; CnCount--, Cls++, Lcn.QuadPart++)
+		for (; CnCount; CnCount--, Lcn++)
 		{
-			ULONGLONG	i = 0;
-			ULONGLONG	base = volume->FirstDataSector + (Lcn.QuadPart * sectorsPerCluster);
-			for (i = 0; i < sectorsPerCluster; i++)
+			ULONGLONG base = volume->FirstDataSector + (Lcn * sectorsPerCluster);
+			for (ULONG i = 0; i < sectorsPerCluster; i++)
 			{
 				// 设置位图
 				DPBitmap_Set(volume->BitmapAllow, base + i, TRUE);
@@ -525,7 +475,7 @@ NTSTATUS SetDirectReadWriteFile(PVOLUME_INFO volume, PWCHAR path)
 			}
 		}
 
-		PrevVCN = pVcnPairs->Extents[r].NextVcn;
+		PrevVCN = NextVCN;
 	}
 
 	__free(pVcnPairs);
@@ -623,6 +573,7 @@ void InitVolumeLetter()
 // 初始化保护卷（获取保护卷信息、获取位图）
 void InitProtectVolumes()
 {
+	WCHAR strMsg[512]; // 临时变量，放在此处缩小栈空间
 	for (UCHAR i = 0; i < Config.ProtectVolumeCount; i++)
 	{
 		USHORT DiskNum = DISKFILTER_DISKNUM_FROM_VOLNUM(Config.ProtectVolume[i]);
@@ -686,6 +637,8 @@ void InitProtectVolumes()
 					if (NT_SUCCESS(status))
 					{
 						VaildVolumeCount = Cur + 1;
+						swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
+						LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_OK, strMsg, wcslen(strMsg));
 					}
 					else
 					{
@@ -696,7 +649,6 @@ void InitProtectVolumes()
 							FALSE
 						);
 						LogErr("Failed to get thread handle\n");
-						WCHAR strMsg[512];
 						swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
 						LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
 					}
@@ -704,7 +656,6 @@ void InitProtectVolumes()
 				else
 				{
 					LogInfo("Failed to create handler thread\n");
-					WCHAR strMsg[512];
 					swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
 					LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
 				}
@@ -712,7 +663,6 @@ void InitProtectVolumes()
 			else
 			{
 				LogInfo("Failed to get volume logic bitmap\n");
-				WCHAR strMsg[512];
 				swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
 				LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
 			}
@@ -922,20 +872,29 @@ void CheckThawSpace()
 	}
 }
 
+// 判断扇区是否允许直接操作
+__inline BOOL IsSectorAllow(PVOLUME_INFO volumeInfo, ULONGLONG index)
+{
+	if (index < volumeInfo->FirstDataSector)
+	{
+		return FALSE;
+	}
+
+	return DPBitmap_Test(volumeInfo->BitmapAllow, index);
+}
+
 // 判断文件是否可信（文件扇区是否未被重定向）
 NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 {
-	NTSTATUS	status;
-	HANDLE		fileHandle = (HANDLE)-1;
 	PFILE_OBJECT	fileObject = NULL;
 	PRETRIEVAL_POINTERS_BUFFER	pVcnPairs = NULL;
 	PVOLUME_INFO	volumeInfo = NULL;
 	ULONG	sectorsPerCluster;
-	UNICODE_STRING filePathNew = { 0 };
 
 	BOOLEAN	IsCreditable = FALSE;
 
-	status = GetFileHandleReadOnly(&fileHandle, filePath);
+	HANDLE fileHandle = (HANDLE)-1;
+	NTSTATUS status = GetFileHandleReadOnly(&fileHandle, filePath);
 
 	if (!NT_SUCCESS(status))
 	{
@@ -992,6 +951,7 @@ NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 		__free(pVcnPairs);
 		fileHandle = (HANDLE)-1;
 		WCHAR append[] = L":WofCompressedData:$DATA";
+		UNICODE_STRING filePathNew = { 0 };
 		if (NT_SUCCESS(RtlAllocateUnicodeString(&filePathNew, filePath->Length + sizeof(append))))
 		{
 			if (NT_SUCCESS(RtlAppendUnicodeStringToString(&filePathNew, filePath)) &&
@@ -1023,13 +983,11 @@ NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 				if (!NT_SUCCESS(status))
 				{
 					LogWarn("Failed to open file: %wZ, error code 0x%.8X\n", &filePathNew, status);
+					__free(filePathNew.Buffer);
 					goto out;
 				}
 			}
-		}
-		else
-		{
-			filePathNew.Buffer = NULL;
+			__free(filePathNew.Buffer);
 		}
 		if (fileHandle == (HANDLE)-1)
 		{
@@ -1045,54 +1003,37 @@ NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 		}
 	}
 
-	ULONG	Cls, r;
-	LARGE_INTEGER	PrevVCN = pVcnPairs->StartingVcn;
-	for (r = 0, Cls = 0; r < pVcnPairs->ExtentCount; r++)
+	ULONGLONG PrevVCN = pVcnPairs->StartingVcn.QuadPart;
+	for (ULONG r = 0; r < pVcnPairs->ExtentCount; r++)
 	{
-		ULONG	CnCount;
-		LARGE_INTEGER Lcn = pVcnPairs->Extents[r].Lcn;
+		ULONGLONG NextVCN = pVcnPairs->Extents[r].NextVcn.QuadPart;
+		ULONG CnCount = (ULONG)(NextVCN - PrevVCN);
+		ULONGLONG Lcn = pVcnPairs->Extents[r].Lcn.QuadPart;
 
-		for (CnCount = (ULONG)(pVcnPairs->Extents[r].NextVcn.QuadPart - PrevVCN.QuadPart);
-			CnCount; CnCount--, Cls++, Lcn.QuadPart++)
+		for (; CnCount; CnCount--, Lcn++)
 		{
-			ULONGLONG	i = 0;
-			ULONGLONG	base = volumeInfo->FirstDataSector + (Lcn.QuadPart * sectorsPerCluster);
-			for (i = 0; i < sectorsPerCluster; i++)
+			ULONGLONG base = volumeInfo->FirstDataSector + (Lcn * sectorsPerCluster);
+			for (ULONG i = 0; i < sectorsPerCluster; i++)
 			{
-				// 此扇区被重定向了, 不可信文件, 终止认证
-				if (base + i >= volumeInfo->SectorCount || DPBitmap_Test(volumeInfo->BitmapRedirect, base + i))
+				// 此扇区被重定向了或允许直接写入（例如覆盖bootstat.dat）, 不可信文件, 终止认证
+				if (base + i >= volumeInfo->SectorCount || DPBitmap_Test(volumeInfo->BitmapRedirect, base + i) || IsSectorAllow(volumeInfo, base + i))
 				{
-					LogInfo("File %wZ sector %llu has been redirected\n", filePath, base + i);
+					LogInfo("File %wZ sector %llu has been redirected or allow direct write\n", filePath, base + i);
 					goto __exit;
 				}
 			}
 		}
-		PrevVCN = pVcnPairs->Extents[r].NextVcn;
+		PrevVCN = NextVCN;
 	}
 
 	// 经过考验
 	IsCreditable = TRUE;
 
 __exit:
-
 	__free(pVcnPairs);
 
 out:
-	if (filePathNew.Buffer != NULL)
-		__free(filePathNew.Buffer);
-
 	return IsCreditable ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-}
-
-// 判断扇区是否允许直接操作
-__inline BOOL IsSectorAllow(PVOLUME_INFO volumeInfo, ULONGLONG index)
-{
-	if (index < volumeInfo->FirstDataSector)
-	{
-		return FALSE;
-	}
-
-	return DPBitmap_Test(volumeInfo->BitmapAllow, index);
 }
 
 // 获取真实需要读取的扇区
@@ -1109,27 +1050,59 @@ ULONGLONG GetRealSectorForRead(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex)
 	// 此扇区是否已经被重定向
 	if (DPBitmap_Test(volumeInfo->BitmapRedirect, orgIndex))
 	{
-		// 找到重定向到哪里, 并返回	
-		PREDIRECT_INFO	result;
-		REDIRECT_INFO	pair;
-		pair.OriginalIndex = orgIndex;
-
-		result = (PREDIRECT_INFO)RtlLookupElementGenericTable(&volumeInfo->RedirectMap, &pair);
-
-		if (result)
-		{
-			mapIndex = result->MappedIndex;
-			return mapIndex;
-		}
+		// 找到重定向到哪里, 并返回
+		RedirectTable_Lookup(&volumeInfo->RedirectMap, orgIndex, &mapIndex);
 	}
-
 	return mapIndex;
 }
 
+// 添加重定向记录
+void AddRedirectRecord(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULONGLONG realIndex, ULONG sectorCount)
+{
+	RedirectTable_Insert(&volumeInfo->RedirectMap, orgIndex, realIndex, sectorCount);
+	if (AllowDirectMount)
+		RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, realIndex, orgIndex, sectorCount);
+}
+
+// 更新重定向记录 把重定向到orgIndex的记录修改为realIndex
+void UpdateRedirectRecord(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULONGLONG realIndex, ULONG sectorCount)
+{
+	ULONGLONG prevStart = (ULONGLONG)-1;
+	ULONGLONG prevSector = (ULONGLONG)-1;
+	ULONGLONG sectorOffset = 0;
+	for (ULONG i = 0; i < sectorCount; i++)
+	{
+		ULONGLONG mapIndex = (ULONGLONG)-1;
+		RedirectTable_Lookup(&volumeInfo->ReverseRedirectMap, orgIndex + i, &mapIndex);
+		if (mapIndex != -1)
+		{
+			if (prevSector == -1 || mapIndex != prevSector + 1)
+			{
+				if (prevStart != -1 && prevSector != -1)
+				{
+					RedirectTable_Delete(&volumeInfo->RedirectMap, prevStart, prevSector - prevStart + 1);
+					AddRedirectRecord(volumeInfo, prevStart, realIndex + sectorOffset, prevSector - prevStart + 1);
+				}
+				prevStart = mapIndex;
+				sectorOffset = i;
+			}
+		}
+		prevSector = mapIndex;
+	}
+	if (prevStart != -1 && prevSector != -1)
+	{
+		RedirectTable_Delete(&volumeInfo->RedirectMap, prevStart, prevSector - prevStart + 1);
+		AddRedirectRecord(volumeInfo, prevStart, realIndex + sectorOffset, prevSector - prevStart + 1);
+	}
+	RedirectTable_Delete(&volumeInfo->ReverseRedirectMap, orgIndex, sectorCount);
+}
+
 // 获取真实需要写入的扇区
-ULONGLONG GetRealSectorForWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex)
+ULONGLONG GetRealSectorForWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, PBOOLEAN needRedirect)
 {
 	ULONGLONG	mapIndex = (ULONGLONG)-1;
+
+	*needRedirect = FALSE; // 默认不修改重定向表
 
 	// 此扇区是否允许直接写
 	if (IsSectorAllow(volumeInfo, orgIndex))
@@ -1140,17 +1113,8 @@ ULONGLONG GetRealSectorForWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex)
 	// 此扇区是否已经被重定向
 	if (DPBitmap_Test(volumeInfo->BitmapRedirect, orgIndex))
 	{
-		// 找到重定向到哪里, 并返回	
-		PREDIRECT_INFO	result;
-		REDIRECT_INFO	pair;
-		pair.OriginalIndex = orgIndex;
-
-		result = (PREDIRECT_INFO)RtlLookupElementGenericTable(&volumeInfo->RedirectMap, &pair);
-
-		if (result)
-		{
-			mapIndex = result->MappedIndex;
-		}
+		// 找到重定向到哪里, 并返回
+		RedirectTable_Lookup(&volumeInfo->RedirectMap, orgIndex, &mapIndex);
 	}
 	else
 	{
@@ -1170,17 +1134,9 @@ ULONGLONG GetRealSectorForWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex)
 
 			// 标记被重定向使用的扇区
 			DPBitmap_Set(volumeInfo->BitmapRedirectUsed, mapIndex, TRUE);
-
-			// 加入重定向列表
-			{
-				REDIRECT_INFO	pair;
-				pair.OriginalIndex = orgIndex;
-				pair.MappedIndex = mapIndex;
-				RtlInsertElementGenericTable(&volumeInfo->RedirectMap, &pair, sizeof(REDIRECT_INFO), NULL);
-				pair.OriginalIndex = mapIndex;
-				pair.MappedIndex = orgIndex;
-				RtlInsertElementGenericTable(&volumeInfo->ReverseRedirectMap, &pair, sizeof(REDIRECT_INFO), NULL);
-			}
+			
+			// 优化：此处不加入重定向列表，重定向列表存储连续扇区，在最终操作时存入重定向列表
+			*needRedirect = TRUE;
 		}
 	}
 
@@ -1205,10 +1161,14 @@ NTSTATUS HandleDiskRequest(
 
 	// 以下几个参数为判断为处理的扇区是连续的扇区而设
 	BOOLEAN		isFirstBlock = TRUE;
+	ULONGLONG	prevStart = (ULONGLONG)-1;
 	ULONGLONG	prevIndex = (ULONGLONG)-1;
 	ULONGLONG	prevOffset = (ULONGLONG)-1;
 	PVOID		prevBuffer = NULL;
 	ULONG		totalProcessBytes = 0;
+
+	BOOLEAN		prevNeedRedirect = FALSE; // 判断是否修改重定向表
+	BOOLEAN		needRedirect = FALSE;
 
 	// 判断上次要处理的扇区跟这次要处理的扇区是否连续，连续了就一起处理，否则单独处理, 加快速度
 	while (length)
@@ -1221,11 +1181,22 @@ NTSTATUS HandleDiskRequest(
 		}
 		else
 		{
-			realIndex = GetRealSectorForWrite(volumeInfo, sectorIndex);
+			realIndex = GetRealSectorForWrite(volumeInfo, sectorIndex, &needRedirect);
 		}
 
 		if (-1 == realIndex)
 		{
+			if (!isFirstBlock)
+			{
+				status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], majorFunction, volumeInfo->StartOffset + prevOffset,
+					prevBuffer, totalProcessBytes, TRUE);
+
+				// 判断是否要加入重定向列表
+				if (prevNeedRedirect)
+				{
+					AddRedirectRecord(volumeInfo, prevStart, prevOffset / bytesPerSector, totalProcessBytes / bytesPerSector);
+				}
+			}
 			return STATUS_DISK_FULL;
 		}
 
@@ -1235,10 +1206,12 @@ NTSTATUS HandleDiskRequest(
 		// 初始prevIndex
 		if (isFirstBlock)
 		{
+			prevStart = sectorIndex;
 			prevIndex = realIndex;
 			prevOffset = physicalOffset;
 			prevBuffer = buff;
 			totalProcessBytes = bytesPerSector;
+			prevNeedRedirect = needRedirect;
 
 			isFirstBlock = FALSE;
 
@@ -1246,7 +1219,7 @@ NTSTATUS HandleDiskRequest(
 		}
 
 		// 测试是否连继,  如果连续，跳到下个判断
-		if (realIndex == prevIndex + 1)
+		if (prevIndex != -1 && realIndex == prevIndex + 1 && needRedirect == prevNeedRedirect)
 		{
 			prevIndex = realIndex;
 			totalProcessBytes += bytesPerSector;
@@ -1259,6 +1232,12 @@ NTSTATUS HandleDiskRequest(
 			status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], majorFunction, volumeInfo->StartOffset + prevOffset,
 				prevBuffer, totalProcessBytes, TRUE);
 
+			// 判断是否要加入重定向列表
+			if (prevNeedRedirect)
+			{
+				AddRedirectRecord(volumeInfo, prevStart, prevOffset / bytesPerSector, totalProcessBytes / bytesPerSector);
+			}
+
 			// 重新初始化
 			goto __reInit;
 		}
@@ -1268,6 +1247,12 @@ NTSTATUS HandleDiskRequest(
 		{
 			status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], majorFunction, volumeInfo->StartOffset + prevOffset,
 				prevBuffer, totalProcessBytes, TRUE);
+
+			// 判断是否要加入重定向列表
+			if (prevNeedRedirect)
+			{
+				AddRedirectRecord(volumeInfo, prevStart, prevOffset / bytesPerSector, totalProcessBytes / bytesPerSector);
+			}
 
 			// 中断退出
 			break;
@@ -1282,10 +1267,12 @@ NTSTATUS HandleDiskRequest(
 	return status;
 }
 
-// 直接写入时获取真实需要写入的扇区
-ULONGLONG GetRealSectorForDirectWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex)
+// 直接写入时获取真实需要写入的备份扇区
+ULONGLONG GetRealSectorForDirectWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, PUCHAR modifyType)
 {
 	ULONGLONG	mapIndex = (ULONGLONG)-1;
+
+	*modifyType = 0; // 默认不修改重定向表
 
 	// 此扇区是否允许直接写
 	if (IsSectorAllow(volumeInfo, orgIndex))
@@ -1298,75 +1285,55 @@ ULONGLONG GetRealSectorForDirectWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgInde
 	{
 		// 标记为非空闲
 		DPBitmap_Set(volumeInfo->BitmapUsed, orgIndex, TRUE);
-		// 加入反向重定向列表
-		{
-			REDIRECT_INFO	pair;
-			pair.OriginalIndex = orgIndex;
-			pair.MappedIndex = -1;
-			RtlInsertElementGenericTable(&volumeInfo->ReverseRedirectMap, &pair, sizeof(REDIRECT_INFO), NULL);
-			DPBitmap_Set(volumeInfo->BitmapRedirectUsed, orgIndex, TRUE);
-		}
+		DPBitmap_Set(volumeInfo->BitmapRedirectUsed, orgIndex, TRUE);
+		*modifyType = 1; // 向反向重定向表添加一条orgIndex到-1的映射
 		return -1;
 	}
 
 	// 此扇区是否被重定向使用
 	if (DPBitmap_Test(volumeInfo->BitmapRedirectUsed, orgIndex))
 	{
-		PREDIRECT_INFO	result;
-		REDIRECT_INFO	pair;
-		pair.OriginalIndex = orgIndex;
-		result = (PREDIRECT_INFO)RtlLookupElementGenericTable(&volumeInfo->ReverseRedirectMap, &pair);
-		if (result)
+		ULONGLONG oldSector = -1; // 原扇区
+		RedirectTable_Lookup(&volumeInfo->ReverseRedirectMap, orgIndex, &oldSector);
+		if (oldSector == -1) // 之前是空闲状态，无需处理
 		{
-			ULONGLONG oldSector = result->MappedIndex; // 原扇区
-			if (oldSector == -1) // 之前是空闲状态，无需处理
-			{
-				return -1;
-			}
-			// 查找下一个可用的空闲扇区
-			mapIndex = DPBitmap_FindNext(volumeInfo->BitmapUsed, volumeInfo->LastScanIndex, FALSE);
+			return -1;
+		}
+		// 查找下一个可用的空闲扇区
+		mapIndex = DPBitmap_FindNext(volumeInfo->BitmapUsed, volumeInfo->LastScanIndex, FALSE);
 
-			if (mapIndex != -1)
-			{
-				// lastScan = 当前用到的 + 1
-				volumeInfo->LastScanIndex = mapIndex + 1;
+		if (mapIndex != -1)
+		{
+			// lastScan = 当前用到的 + 1
+			volumeInfo->LastScanIndex = mapIndex + 1;
 
-				// 标记为非空闲
-				DPBitmap_Set(volumeInfo->BitmapUsed, mapIndex, TRUE);
+			// 标记为非空闲
+			DPBitmap_Set(volumeInfo->BitmapUsed, mapIndex, TRUE);
 
-				// 标记重定向使用的扇区
-				DPBitmap_Set(volumeInfo->BitmapRedirectUsed, mapIndex, TRUE);
+			// 标记重定向使用的扇区
+			DPBitmap_Set(volumeInfo->BitmapRedirectUsed, mapIndex, TRUE);
 
-				// 删除原有重定向记录
-				pair.OriginalIndex = oldSector;
-				RtlDeleteElementGenericTable(&volumeInfo->RedirectMap, &pair);
-				pair.OriginalIndex = orgIndex;
-				RtlDeleteElementGenericTable(&volumeInfo->ReverseRedirectMap, &pair);
-				DPBitmap_Set(volumeInfo->BitmapRedirectUsed, orgIndex, FALSE);
+			// 删除原有反向重定向记录
+			DPBitmap_Set(volumeInfo->BitmapRedirectUsed, orgIndex, FALSE);
 
-				// 加入重定向列表和反向重定向列表
-				{
-					REDIRECT_INFO	pair;
-					pair.OriginalIndex = oldSector;
-					pair.MappedIndex = mapIndex;
-					RtlInsertElementGenericTable(&volumeInfo->RedirectMap, &pair, sizeof(REDIRECT_INFO), NULL);
-					pair.OriginalIndex = mapIndex;
-					pair.MappedIndex = oldSector;
-					RtlInsertElementGenericTable(&volumeInfo->ReverseRedirectMap, &pair, sizeof(REDIRECT_INFO), NULL);
-				}
-			}
+			*modifyType = 2; // 将重定向表中oldSector到orgIndex的记录修改为mapIndex
 		}
 	}
 	// 否则，此扇区是原来就使用的扇区，如果还没有被重定向，那么就进行重定向
 	else if (!DPBitmap_Test(volumeInfo->BitmapRedirect, orgIndex))
 	{
-		mapIndex = GetRealSectorForWrite(volumeInfo, orgIndex);
+		BOOLEAN needModify = FALSE;
+		mapIndex = GetRealSectorForWrite(volumeInfo, orgIndex, &needModify);
+		if (needModify)
+		{
+			*modifyType = 3; // 向重定向表中添加一条orgIndex到mapIndex的记录
+		}
 	}
 
 	return mapIndex;
 }
 
-// 准备对硬盘的直接写操作
+// 准备对硬盘的直接写操作，备份直接读写要覆盖的扇区并修改重定向表，以保证直接读写不会影响保护卷
 NTSTATUS PrepareForDirectWriteRequest(
 	PVOLUME_INFO volumeInfo,
 	ULONGLONG logicOffset,
@@ -1382,10 +1349,14 @@ NTSTATUS PrepareForDirectWriteRequest(
 
 	// 以下几个参数为判断为处理的扇区是连续的扇区而设
 	BOOLEAN		isFirstBlock = TRUE;
+	ULONGLONG	prevStart = (ULONGLONG)-1;
 	ULONGLONG	prevIndex = (ULONGLONG)-1;
 	ULONGLONG	prevOffset = (ULONGLONG)-1;
 	PVOID		prevBuffer = NULL;
 	ULONG		totalProcessBytes = 0;
+
+	UCHAR		prevModifyType = 0; // 判断是否修改重定向表
+	UCHAR		modifyType = 0;
 
 	void * buff_mem;
 	void * buff;
@@ -1405,26 +1376,7 @@ NTSTATUS PrepareForDirectWriteRequest(
 	{
 		sectorIndex = logicOffset / bytesPerSector;
 
-		realIndex = GetRealSectorForDirectWrite(volumeInfo, sectorIndex);
-
-		if (-1 == realIndex) // 返回-1表示不需要对这个扇区处理，直接跳过
-		{
-			// 既然要跳过这个扇区，那么上次要处理的扇区跟下次要处理的扇区就一定不连续
-			if (!isFirstBlock)
-			{
-				isFirstBlock = TRUE;
-				status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_WRITE, volumeInfo->StartOffset + prevOffset,
-					prevBuffer, totalProcessBytes, TRUE);
-			}
-
-			if (bytesPerSector >= length)
-				break;
-
-			logicOffset += (ULONGLONG)bytesPerSector;
-			buff = (char *)buff + bytesPerSector;
-			length -= bytesPerSector;
-			continue;
-		}
+		realIndex = GetRealSectorForDirectWrite(volumeInfo, sectorIndex, &modifyType);
 
 		physicalOffset = realIndex * bytesPerSector;
 
@@ -1432,10 +1384,12 @@ NTSTATUS PrepareForDirectWriteRequest(
 		// 初始prevIndex
 		if (isFirstBlock)
 		{
+			prevStart = sectorIndex;
 			prevIndex = realIndex;
 			prevOffset = physicalOffset;
 			prevBuffer = buff;
 			totalProcessBytes = bytesPerSector;
+			prevModifyType = modifyType;
 
 			isFirstBlock = FALSE;
 
@@ -1443,7 +1397,7 @@ NTSTATUS PrepareForDirectWriteRequest(
 		}
 
 		// 测试是否连继,  如果连续，跳到下个判断
-		if (realIndex == prevIndex + 1)
+		if (((realIndex != -1 && prevIndex != -1 && realIndex == prevIndex + 1) || (realIndex == -1 && prevIndex == -1)) && modifyType == prevModifyType)
 		{
 			prevIndex = realIndex;
 			totalProcessBytes += bytesPerSector;
@@ -1453,8 +1407,23 @@ NTSTATUS PrepareForDirectWriteRequest(
 		else
 		{
 			isFirstBlock = TRUE;
-			status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_WRITE, volumeInfo->StartOffset + prevOffset,
-				prevBuffer, totalProcessBytes, TRUE);
+			if (prevIndex != -1)
+				status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_WRITE, volumeInfo->StartOffset + prevOffset,
+					prevBuffer, totalProcessBytes, TRUE);
+
+			// 判断是否要加入重定向列表和反向重定向列表
+			if (prevModifyType == 1)
+			{
+				RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, prevStart, -1, totalProcessBytes / bytesPerSector);
+			}
+			else if (prevModifyType == 2)
+			{
+				UpdateRedirectRecord(volumeInfo, prevStart, prevOffset / bytesPerSector, totalProcessBytes / bytesPerSector);
+			}
+			else if (prevModifyType == 3)
+			{
+				AddRedirectRecord(volumeInfo, prevStart, prevOffset / bytesPerSector, totalProcessBytes / bytesPerSector);
+			}
 
 			// 重新初始化
 			goto __reInit;
@@ -1463,8 +1432,23 @@ NTSTATUS PrepareForDirectWriteRequest(
 		// 最后一个扇区
 		if (bytesPerSector >= length)
 		{
-			status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_WRITE, volumeInfo->StartOffset + prevOffset,
-				prevBuffer, totalProcessBytes, TRUE);
+			if (prevIndex != -1)
+				status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_WRITE, volumeInfo->StartOffset + prevOffset,
+					prevBuffer, totalProcessBytes, TRUE);
+
+			// 判断是否要加入重定向列表和反向重定向列表
+			if (prevModifyType == 1)
+			{
+				RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, prevStart, -1, totalProcessBytes / bytesPerSector);
+			}
+			else if (prevModifyType == 2)
+			{
+				UpdateRedirectRecord(volumeInfo, prevStart, prevOffset / bytesPerSector, totalProcessBytes / bytesPerSector);
+			}
+			else if (prevModifyType == 3)
+			{
+				AddRedirectRecord(volumeInfo, prevStart, prevOffset / bytesPerSector, totalProcessBytes / bytesPerSector);
+			}
 
 			// 中断退出
 			break;
@@ -1616,8 +1600,13 @@ void ThreadReadWrite(PVOID Context)
 				if (IRP_MJ_READ == io_stack->MajorFunction)
 				{
 					if (IsDirectDiskDevice(io_stack->DeviceObject))
-						status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
-							newbuff, length);
+					{
+						if (AllowDirectMount)
+							status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
+								newbuff, length);
+						else
+							status = STATUS_INVALID_DEVICE_REQUEST;
+					}
 					else
 						status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
 							newbuff, length);
@@ -1627,8 +1616,13 @@ void ThreadReadWrite(PVOID Context)
 				{
 					RtlCopyMemory(newbuff, buffer, length);
 					if (IsDirectDiskDevice(io_stack->DeviceObject))
-						status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
-							newbuff, length);
+					{
+						if (AllowDirectMount)
+							status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
+								newbuff, length);
+						else
+							status = STATUS_INVALID_DEVICE_REQUEST;
+					}
 					else
 						status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
 							newbuff, length);
@@ -1637,6 +1631,7 @@ void ThreadReadWrite(PVOID Context)
 			}
 			else
 			{
+				LogErr("Failed to allocate memory for %u bytes! System will be unstable!!!\n", length);
 				status = STATUS_INSUFFICIENT_RESOURCES;
 			}
 
@@ -1897,12 +1892,12 @@ OnDiskFilterDispatchControl(
 						}
 						break;
 					}
-					Data->Password[sizeof(Data->Password) - 1] = L'\0';
+					Data->Password[sizeof(Data->Password) / sizeof(Data->Password[0]) - 1] = L'\0';
 					UCHAR Password[32];
 					RtlZeroMemory(Password, 32);
 					SHA256(Data->Password, wcslen(Data->Password) * sizeof(WCHAR), Password);
-					BOOL NewConfigVaild = (NewConfig.Magic == DISKFILTER_CONFIG_MAGIC && NewConfig.Version == DISKFILTER_DRIVER_VERSION);
-					BOOL CurConfigVaild = (Config.Magic == DISKFILTER_CONFIG_MAGIC && Config.Version == DISKFILTER_DRIVER_VERSION);
+					BOOLEAN NewConfigVaild = IsVaildConfig(&NewConfig);
+					BOOLEAN CurConfigVaild = IsVaildConfig(&Config);
 					if (!NewConfigVaild && !CurConfigVaild)
 					{
 						*Status = STATUS_UNSUCCESSFUL;
@@ -1918,7 +1913,7 @@ OnDiskFilterDispatchControl(
 					switch (Data->ControlCode)
 					{
 					case DISKFILTER_CONTROL_GETCONFIG:
-						if (OutBufferLength >= sizeof(DISKFILTER_PROTECTION_CONFIG))
+						if (OutBufferLength >= sizeof(NewConfig))
 						{
 							RtlCopyMemory(SystemBuffer, &NewConfig, sizeof(NewConfig));
 							info = sizeof(NewConfig);
@@ -1976,6 +1971,11 @@ OnDiskFilterDispatchControl(
 						break;
 					case DISKFILTER_CONTROL_MOUNT_DIRECT_DISK:
 					{
+						if (!AllowDirectMount)
+						{
+							*Status = STATUS_INVALID_DEVICE_REQUEST;
+							break;
+						}
 						DISKFILTER_DIRECTDISK DirectDiskInfo;
 						RtlCopyMemory(&DirectDiskInfo, &Data->Config, sizeof(DirectDiskInfo));
 						if (FindDirectDiskDeviceByPartition(FilterDevice->DriverObject, DirectDiskInfo.DiskNumber, DirectDiskInfo.PartitionNumber))
@@ -1991,11 +1991,21 @@ OnDiskFilterDispatchControl(
 						}
 						*Status = DirectDiskMount(FilterDevice->DriverObject, DirectDiskCount, DirectDiskInfo.DriveLetter, ProtectedVolume, DirectDiskInfo.ReadOnly);
 						if (NT_SUCCESS(*Status))
+						{
 							InterlockedIncrement((PLONG)&DirectDiskCount);
+							WCHAR strMsg[512];
+							swprintf_s(strMsg, 512, L"(%lu,%lu)", DirectDiskInfo.DiskNumber, DirectDiskInfo.PartitionNumber);
+							LogErrorMessageWithString(FilterDevice, MSG_DIRECT_MOUNT_OK, strMsg, wcslen(strMsg));
+						}
 						break;
 					}
 					case DISKFILTER_CONTROL_UNMOUNT_DIRECT_DISK:
 					{
+						if (!AllowDirectMount)
+						{
+							*Status = STATUS_INVALID_DEVICE_REQUEST;
+							break;
+						}
 						ULONG Number;
 						RtlCopyMemory(&Number, &Data->Config, sizeof(Number));
 						PDEVICE_OBJECT DirectDiskDev = FindDirectDiskDevice(FilterDevice->DriverObject, Number);
@@ -2004,7 +2014,17 @@ OnDiskFilterDispatchControl(
 							*Status = STATUS_NOT_FOUND;
 							break;
 						}
+						DISKFILTER_DIRECTDISK DirectDiskCfg;
+						DirectDiskCfg.DiskNumber = -1;
+						DirectDiskCfg.PartitionNumber = -1;
+						DirectDiskGetConfig(DirectDiskDev, &DirectDiskCfg);
 						*Status = DirectDiskUnmount(DirectDiskDev);
+						if (NT_SUCCESS(*Status))
+						{
+							WCHAR strMsg[512];
+							swprintf_s(strMsg, 512, L"(%lu,%lu)", DirectDiskCfg.DiskNumber, DirectDiskCfg.PartitionNumber);
+							LogErrorMessageWithString(FilterDevice, MSG_DIRECT_UNMOUNT_OK, strMsg, wcslen(strMsg));
+						}
 						break;
 					}
 					case DISKFILTER_CONTROL_GET_DIRECTDISK_STATUS:
@@ -2166,6 +2186,11 @@ void DriverReinit(PDRIVER_OBJECT DriverObject, PVOID Context, ULONG Count)
 
 	CheckThawSpace();
 
+	if (Config.ProtectionFlags & PROTECTION_ALLOW_DIRECT_MOUNT)
+	{
+		AllowDirectMount = TRUE;
+	}
+
 	if (Config.ProtectionFlags & PROTECTION_ENABLE)
 	{
 		InitProtectVolumes();
@@ -2280,6 +2305,7 @@ OnDiskFilterInitialization(
 	ConfigVcnPairs = NULL;
 	IsProtect = FALSE;
 	AllowLoadDriver = TRUE;
+	AllowDirectMount = FALSE;
 	DirectDiskCount = 0;
 
 	WCHAR strAppend[] = L"\\Parameters";

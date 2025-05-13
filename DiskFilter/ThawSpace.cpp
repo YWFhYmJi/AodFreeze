@@ -449,8 +449,8 @@ ThawSpaceDeviceControl(
 
 		partition_information->StartingOffset.QuadPart = 0;
 		partition_information->PartitionLength.QuadPart = length;
-		partition_information->HiddenSectors = 1;
-		partition_information->PartitionNumber = 0;
+		partition_information->HiddenSectors = 0;
+		partition_information->PartitionNumber = (ULONG)-1;
 		partition_information->PartitionType = 0;
 		partition_information->BootIndicator = FALSE;
 		partition_information->RecognizedPartition = FALSE;
@@ -482,12 +482,12 @@ ThawSpaceDeviceControl(
 		partition_information_ex->PartitionStyle = PARTITION_STYLE_MBR;
 		partition_information_ex->StartingOffset.QuadPart = 0;
 		partition_information_ex->PartitionLength.QuadPart = length;
-		partition_information_ex->PartitionNumber = 0;
+		partition_information_ex->PartitionNumber = (ULONG)-1;
 		partition_information_ex->RewritePartition = FALSE;
 		partition_information_ex->Mbr.PartitionType = 0;
 		partition_information_ex->Mbr.BootIndicator = FALSE;
 		partition_information_ex->Mbr.RecognizedPartition = FALSE;
-		partition_information_ex->Mbr.HiddenSectors = 1;
+		partition_information_ex->Mbr.HiddenSectors = 0;
 
 		status = STATUS_SUCCESS;
 		Irp->IoStatus.Information = sizeof(PARTITION_INFORMATION_EX);
