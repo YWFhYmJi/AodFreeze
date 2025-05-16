@@ -22,6 +22,14 @@ EXTERN_C VOID InbvSetScrollRegion(ULONG left, ULONG top, ULONG width, ULONG heig
 EXTERN_C VOID InbvInstallDisplayStringFilter(ULONG b);
 EXTERN_C VOID InbvEnableDisplayString(ULONG b);
 
+// 保护硬盘特定扇区所用到的信息
+typedef struct _DISK_INFO
+{
+	ULONG		BytesPerSector;		// 每个扇区的大小
+	ULONGLONG	SectorCount;		// 硬盘总扇区数
+	PDP_BITMAP	BitmapDeny;			// 阻止写入的扇区位图(MBR,EBR)
+} DISK_INFO, *PDISK_INFO;
+
 // 保护配置文件路径、文件对象、所在盘符、所在扇区
 UNICODE_STRING ConfigPath;
 PFILE_OBJECT ConfigFileObject;
@@ -35,6 +43,7 @@ ERESOURCE DriverListLock; // 驱动策略锁
 VOLUME_INFO ProtectVolumeList[256]; // 保护卷列表
 PVOLUME_INFO VolumeList[26]; // 盘符对应的保护卷
 UINT VaildVolumeCount; // 保护卷数量
+DISK_INFO ProtectDiskList[256]; // 硬盘保护信息
 BOOLEAN IsProtect; // 是否在保护状态
 BOOLEAN AllowLoadDriver; // 是否允许加载驱动
 BOOLEAN AllowDirectMount; // 是否允许直接挂载
@@ -279,7 +288,7 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 // 写入保护配置
 NTSTATUS WriteProtectionConfig(PDISKFILTER_PROTECTION_CONFIG ConfigData)
 {
-	if (ConfigVolume.Volume == 0 || !ConfigVcnPairs || ConfigVcnPairs->Extents[0].Lcn.QuadPart == -1) // 配置文件不支持压缩
+	if (ConfigVolume.Volume == 0 || ConfigVolume.DiskNumber >= sizeof(LowerDeviceObject) / sizeof(*LowerDeviceObject) || !ConfigVcnPairs || ConfigVcnPairs->Extents[0].Lcn.QuadPart == -1) // 配置文件不支持压缩
 		return STATUS_UNSUCCESSFUL;
 
 	ULONG sectorsPerCluster = ConfigVolume.BytesPerCluster / ConfigVolume.BytesPerSector;
@@ -568,6 +577,207 @@ void InitVolumeLetter()
 		}
 	}
 	LogInfo("Volume letter initialization finished\n");
+}
+
+// 获取硬盘信息
+NTSTATUS GetDiskInfo(ULONG DiskNum, PDISK_INFO info)
+{
+	NTSTATUS status;
+	HANDLE fileHandle;
+	UNICODE_STRING fileName;
+	OBJECT_ATTRIBUTES oa;
+	IO_STATUS_BLOCK IoStatusBlock;
+
+	WCHAR diskName[MAX_PATH];
+
+	RtlZeroMemory(info, sizeof(DISK_INFO));
+
+	swprintf_s(diskName, MAX_PATH, L"\\Device\\Harddisk%d\\Partition0", DiskNum);
+
+	RtlInitUnicodeString(&fileName, diskName);
+
+	InitializeObjectAttributes(&oa,
+		&fileName,
+		OBJ_CASE_INSENSITIVE,
+		NULL,
+		NULL);
+
+	status = ZwCreateFile(&fileHandle,
+		GENERIC_ALL | SYNCHRONIZE,
+		&oa,
+		&IoStatusBlock,
+		NULL,
+		0,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		FILE_OPEN,
+		FILE_SYNCHRONOUS_IO_NONALERT,	// 同步读写
+		NULL,
+		0);
+
+	if (NT_SUCCESS(status))
+	{
+		IO_STATUS_BLOCK				ioBlock;
+		DISK_GEOMETRY				diskGeometry;
+		GET_LENGTH_INFORMATION		diskLength;
+		PDRIVE_LAYOUT_INFORMATION_EX pInfo;
+		ULONG InfoSize = sizeof(DRIVE_LAYOUT_INFORMATION_EX);
+
+		status = ZwDeviceIoControlFile(fileHandle,
+			NULL,
+			NULL,
+			NULL,
+			&ioBlock,
+			IOCTL_DISK_GET_DRIVE_GEOMETRY,
+			NULL,
+			0,
+			&diskGeometry,
+			sizeof(diskGeometry)
+		);
+
+		if (!NT_SUCCESS(status))
+		{
+			ZwClose(fileHandle);
+			LogWarn("Failed to read disk geometry for disk %lu, error code = 0x%.8X\n", DiskNum, status);
+			return status;
+		}
+
+		status = ZwDeviceIoControlFile(fileHandle,
+			NULL,
+			NULL,
+			NULL,
+			&ioBlock,
+			IOCTL_DISK_GET_LENGTH_INFO,
+			NULL,
+			0,
+			&diskLength,
+			sizeof(diskLength)
+		);
+
+		if (!NT_SUCCESS(status))
+		{
+			ZwClose(fileHandle);
+			LogWarn("Failed to read disk length for disk %lu, error code = 0x%.8X\n", DiskNum, status);
+			return status;
+		}
+
+		do
+		{
+			InfoSize += sizeof(PARTITION_INFORMATION_EX);
+
+			pInfo = (PDRIVE_LAYOUT_INFORMATION_EX)__malloc(InfoSize);
+			if (!pInfo)
+			{
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				break;
+			}
+
+			status = ZwDeviceIoControlFile(fileHandle,
+				NULL,
+				NULL,
+				NULL,
+				&ioBlock,
+				IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+				NULL,
+				0,
+				pInfo,
+				InfoSize
+			);
+
+			if (status == STATUS_BUFFER_TOO_SMALL)
+				__free(pInfo);
+		} while (status == STATUS_BUFFER_TOO_SMALL);
+
+		ZwClose(fileHandle);
+
+		if (!NT_SUCCESS(status))
+		{
+			if (pInfo)
+				__free(pInfo);
+
+			LogWarn("Failed to get drive layout for disk %lu, error code = 0x%.8X\n", DiskNum, status);
+			return status;
+		}
+
+		info->BytesPerSector = diskGeometry.BytesPerSector;
+		info->SectorCount = diskLength.Length.QuadPart / diskGeometry.BytesPerSector;
+		// 以扇区为单位的位图
+		if (!NT_SUCCESS(DPBitmap_Create(&info->BitmapDeny, info->SectorCount, BITMAP_SLOT_SIZE)))
+		{
+			if (pInfo)
+				__free(pInfo);
+
+			return STATUS_UNSUCCESSFUL;
+		}
+		DPBitmap_Set(info->BitmapDeny, 0, TRUE);
+		if (pInfo->PartitionStyle == PARTITION_STYLE_MBR)
+		{
+			LogInfo("Disk %lu is MBR style\n", DiskNum);
+			ULONGLONG FirstSector = (ULONGLONG)-1;
+			for (ULONG i = 0; i < pInfo->PartitionCount; i++)
+			{
+				if (pInfo->PartitionEntry[i].Mbr.PartitionType == PARTITION_ENTRY_UNUSED)
+					continue;
+				DWORD PartitionNum = pInfo->PartitionEntry[i].PartitionNumber;
+				ULONGLONG StartSector = pInfo->PartitionEntry[i].StartingOffset.QuadPart / diskGeometry.BytesPerSector;
+				FirstSector = min(FirstSector, StartSector);
+				if (PartitionNum != 0)
+					continue;
+				if (IsContainerPartition(pInfo->PartitionEntry[i].Mbr.PartitionType))
+				{
+					LogInfo("Found extend partition in sector %llu\n", StartSector);
+					DPBitmap_Set(info->BitmapDeny, StartSector, TRUE);
+				}
+			}
+			if (FirstSector != -1)
+			{
+				LogInfo("First partition start sector %llu\n", FirstSector);
+				for (ULONGLONG i = 0; i < FirstSector; i++)
+				{
+					DPBitmap_Set(info->BitmapDeny, i, TRUE);
+				}
+			}
+		}
+		else if (pInfo->PartitionStyle == PARTITION_STYLE_GPT)
+		{
+			LogInfo("Disk %lu is GPT style\n", DiskNum);
+			for (ULONGLONG i = 0; i < 34; i++)
+			{
+				DPBitmap_Set(info->BitmapDeny, i, TRUE);
+				DPBitmap_Set(info->BitmapDeny, info->SectorCount - i - 1, TRUE);
+			}
+		}
+		else
+		{
+			LogInfo("Unknown disk %lu style\n", DiskNum);
+		}
+
+		if (pInfo)
+			__free(pInfo);
+	}
+	else
+	{
+		LogWarn("Failed to open the disk %wZ, error code = 0x%.8X\n", &fileName, status);
+	}
+
+	return status;
+}
+
+// 初始化保护硬盘
+void InitProtectDisks()
+{
+	for (UCHAR i = 0; i < Config.ProtectVolumeCount; i++)
+	{
+		USHORT DiskNum = DISKFILTER_DISKNUM_FROM_VOLNUM(Config.ProtectVolume[i]);
+		if (DiskNum >= sizeof(ProtectDiskList) / sizeof(*ProtectDiskList))
+			continue;
+		if (ProtectDiskList[DiskNum].BitmapDeny)
+			continue;
+		LogInfo("Protected disk: %hu\n", DiskNum);
+		if (NT_SUCCESS(GetDiskInfo(DiskNum, &ProtectDiskList[DiskNum])))
+		{
+			LogInfo("Found vaild disk %hu\n", DiskNum);
+		}
+	}
 }
 
 // 初始化保护卷（获取保护卷信息、获取位图）
@@ -1057,7 +1267,7 @@ ULONGLONG GetRealSectorForRead(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex)
 }
 
 // 添加重定向记录
-void AddRedirectRecord(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULONGLONG realIndex, ULONG sectorCount)
+__inline void AddRedirectRecord(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULONGLONG realIndex, ULONG sectorCount)
 {
 	RedirectTable_Insert(&volumeInfo->RedirectMap, orgIndex, realIndex, sectorCount);
 	if (AllowDirectMount)
@@ -1714,14 +1924,6 @@ OnDiskFilterReadWrite(
 		if (ProtectVolumeList[i].DiskNumber != DeviceNumber)
 			continue;
 
-		// 保护MBR及GPT分区表
-		if (IRP_MJ_WRITE == irpStack->MajorFunction && offset.QuadPart < 34 * 512)
-		{
-			*Status = Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
-			IoCompleteRequest(Irp, IO_NO_INCREMENT);
-			return TRUE;
-		}
-
 		if ((offset.QuadPart >= ProtectVolumeList[i].StartOffset) &&
 			((offset.QuadPart - ProtectVolumeList[i].StartOffset) < ProtectVolumeList[i].BytesTotal)
 			)
@@ -1746,6 +1948,28 @@ OnDiskFilterReadWrite(
 
 			// TRUE表始IPR被拦截
 			return TRUE;
+		}
+	}
+
+	// 保护硬盘上的特定扇区（MBR和GPT分区表,保留扇区,EBR）
+	if (IRP_MJ_WRITE == irpStack->MajorFunction && DeviceNumber < sizeof(ProtectDiskList) / sizeof(*ProtectDiskList) && ProtectDiskList[DeviceNumber].BitmapDeny)
+	{
+		ULONG cacheLength = length;
+		ULONGLONG cacheOffset = offset.QuadPart;
+		ULONG bytesPerSector = ProtectDiskList[DeviceNumber].BytesPerSector;
+		PDP_BITMAP bitmap = ProtectDiskList[DeviceNumber].BitmapDeny;
+		while (cacheLength)
+		{
+			ULONGLONG sectorIndex = cacheOffset / bytesPerSector;
+			if (DPBitmap_Test(bitmap, sectorIndex))
+			{
+				*Status = Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+				IoCompleteRequest(Irp, IO_NO_INCREMENT);
+				LogInfo("Denied write sector %llu on disk %d\n", sectorIndex, DeviceNumber);
+				return TRUE;
+			}
+			cacheOffset += bytesPerSector;
+			cacheLength -= bytesPerSector;
 		}
 	}
 
@@ -1777,16 +2001,7 @@ OnDiskFilterDeviceControl(
 		return FALSE;
 	}
 
-	BOOL flag = FALSE;
-	for (UINT i = 0; i < VaildVolumeCount; i++)
-	{
-		if (ProtectVolumeList[i].DiskNumber == DeviceNumber)
-		{
-			flag = TRUE;
-			break;
-		}
-	}
-	if (!flag)
+	if (DeviceNumber >= sizeof(ProtectDiskList) / sizeof(*ProtectDiskList) || !ProtectDiskList[DeviceNumber].BitmapDeny)
 	{
 		return FALSE;
 	}
@@ -1798,7 +2013,7 @@ OnDiskFilterDeviceControl(
 	case IOCTL_SCSI_PASS_THROUGH_DIRECT:
 		*Status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		LogInfo("Denied SCSI passthrough request to %wZ on disk %d partition %d\n", PhysicalDeviceName, DeviceNumber, PartitionNumber);
+		LogInfo("Denied SCSI passthrough request to %wZ on disk %d\n", PhysicalDeviceName, DeviceNumber);
 		return TRUE;
 	// 防止修改分区表
 	case IOCTL_DISK_SET_DRIVE_LAYOUT:
@@ -1809,7 +2024,7 @@ OnDiskFilterDeviceControl(
 	case IOCTL_DISK_GROW_PARTITION:
 		*Status = Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		LogInfo("Denied set partition information request to %wZ on disk %d partition %d\n", PhysicalDeviceName, DeviceNumber, PartitionNumber);
+		LogInfo("Denied set partition information request to %wZ on disk %d\n", PhysicalDeviceName, DeviceNumber);
 		return TRUE;
 	// 防止格式化硬盘
 	case IOCTL_DISK_COPY_DATA:
@@ -1823,7 +2038,7 @@ OnDiskFilterDeviceControl(
 	case IOCTL_STORAGE_PROTOCOL_COMMAND:
 		*Status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		LogInfo("Denied IOCTL 0x%.8X request to %wZ on disk %d partition %d\n", ControlCode, PhysicalDeviceName, DeviceNumber, PartitionNumber);
+		LogInfo("Denied IOCTL 0x%.8X request to %wZ on disk %d\n", ControlCode, PhysicalDeviceName, DeviceNumber);
 		return TRUE;
 	default:
 		break;
@@ -2194,6 +2409,7 @@ void DriverReinit(PDRIVER_OBJECT DriverObject, PVOID Context, ULONG Count)
 	if (Config.ProtectionFlags & PROTECTION_ENABLE)
 	{
 		InitProtectVolumes();
+		InitProtectDisks();
 		StartProtect();
 
 		LogErrorMessage(FilterDevice, MSG_PROTECTION_ENABLED);
@@ -2301,6 +2517,7 @@ OnDiskFilterInitialization(
 	memset(ProtectVolumeList, 0, sizeof(ProtectVolumeList));
 	memset(VolumeList, 0, sizeof(VolumeList));
 	VaildVolumeCount = 0;
+	memset(ProtectDiskList, 0, sizeof(ProtectDiskList));
 	memset(&ConfigVolume, 0, sizeof(ConfigVolume));
 	ConfigVcnPairs = NULL;
 	IsProtect = FALSE;
