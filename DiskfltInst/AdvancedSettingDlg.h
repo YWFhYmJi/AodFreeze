@@ -42,4 +42,7 @@ public:
 	afx_msg void OnBnClickedThawspaceDel();
 	CListCtrl m_thawspaceList;
 	afx_msg void OnBnClickedMountManage();
+	afx_msg void OnBnClickedThawspaceSelectall();
+	afx_msg void OnBnClickedThawspaceUnhide();
+	afx_msg void OnBnClickedThawspaceHide();
 };

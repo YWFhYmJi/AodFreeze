@@ -96,8 +96,8 @@
     <None Include="res\DiskfltInst.rc2">
       <Filter>Resource Files</Filter>
     </None>
-    <None Include="..\DistDriver\i386\DiskFilter.sys" />
-    <None Include="..\DistDriver\amd64\DiskFilter.sys" />
+    <None Include="..\DistDriver\i386\diskflt.sys" />
+    <None Include="..\DistDriver\amd64\diskflt.sys" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="res\DiskfltInst.ico">

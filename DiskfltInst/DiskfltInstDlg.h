@@ -45,6 +45,7 @@ public:
 	BOOL GetConfigFromControls(PDISKFILTER_PROTECTION_CONFIG Config, ULONGLONG *NeedMemory);
 	afx_msg void OnBnClickedAdvancedsetting();
 	afx_msg void OnBnClickedCheckupdate();
+	afx_msg void OnBnClickedPartitionSelectall();
 };
 
 extern BOOL _isDrvInstall;

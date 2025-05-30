@@ -28,11 +28,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <Inf Include="DiskFilter.inf">
-      <Filter>Driver Files</Filter>
-    </Inf>
-  </ItemGroup>
-  <ItemGroup>
     <ClCompile Include="UsingCPP.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -140,5 +135,10 @@
     <MessageCompile Include="messages.mc">
       <Filter>Resource Files</Filter>
     </MessageCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="diskflt.inf">
+      <Filter>Driver Files</Filter>
+    </Inf>
   </ItemGroup>
 </Project>

@@ -710,9 +710,9 @@ void ChangeDriveIconProtect(WCHAR volume)
 			if (NT_SUCCESS(status))
 			{
 				UNICODE_STRING	keyName;
-				WCHAR iconPath[] = L"%SystemRoot%\\System32\\drivers\\DiskFilter.sys,0";
-				WCHAR iconPathWin7[] = L"%SystemRoot%\\System32\\drivers\\DiskFilter.sys,1";
-				WCHAR iconPathWin10[] = L"%SystemRoot%\\System32\\drivers\\DiskFilter.sys,2";
+				WCHAR iconPath[] = L"%SystemRoot%\\System32\\drivers\\diskflt.sys,0";
+				WCHAR iconPathWin7[] = L"%SystemRoot%\\System32\\drivers\\diskflt.sys,1";
+				WCHAR iconPathWin10[] = L"%SystemRoot%\\System32\\drivers\\diskflt.sys,2";
 
 				RtlInitUnicodeString(&keyName, L"");
 

@@ -171,12 +171,11 @@
     <ResourceCompile Include="diskfltmgmt.rc" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="..\DistDriver\amd64\DiskFilter.sys" />
-    <None Include="..\DistDriver\i386\DiskFilter.sys" />
+    <None Include="..\DistDriver\amd64\diskflt.sys" />
+    <None Include="..\DistDriver\i386\diskflt.sys" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="diskfltmgmt.ico" />
-    <Image Include="icon1.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

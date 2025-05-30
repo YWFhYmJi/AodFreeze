@@ -9,9 +9,7 @@
 #define IDR_DRVX64                      203
 #define IDD_GETPASS                     204
 #define IDD_LOGIN                       205
-#define IDD_DIALOG1                     208
 #define IDD_ADVSET                      208
-#define IDD_DIALOG2                     210
 #define IDD_ADDTHAWSPACE                210
 #define IDD_MOUNTMANAGE                 211
 #define IDD_ADDMOUNT                    212
@@ -55,8 +53,11 @@
 #define IDC_DELETE_MOUNT                1040
 #define IDC_REFRESH_LIST                1041
 #define IDC_READONLY                    1042
-#define IDC_CHECK1                      1050
 #define IDC_ALLOWMOUNT                  1050
+#define IDC_PARTITION_SELECTALL         1050
+#define IDC_THAWSPACE_SELECTALL         1051
+#define IDC_THAWSPACE_UNHIDE            1052
+#define IDC_THAWSPACE_HIDE              1053
 
 // Next default values for new objects
 // 
@@ -64,7 +65,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        212
 #define _APS_NEXT_COMMAND_VALUE         32772
-#define _APS_NEXT_CONTROL_VALUE         1051
+#define _APS_NEXT_CONTROL_VALUE         1057
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif

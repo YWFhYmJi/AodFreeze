@@ -81,6 +81,7 @@ typedef struct {
 typedef struct {
 	BOOLEAN ProtectEnabled;
 	BOOLEAN AllowDriverLoad;
+	BOOLEAN DirectMountEnabled;
 	UCHAR ProtectVolumeCount;
 	UINT ProtectVolume[255];
 } DISKFILTER_STATUS, *PDISKFILTER_STATUS;

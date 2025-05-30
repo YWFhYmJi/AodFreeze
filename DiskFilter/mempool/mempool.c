@@ -1,9 +1,9 @@
 #include "../Pch.h"
 
-#ifdef DBG
+//#ifdef DBG
 #define NO_MEMPOOL
 #undef DBG
-#endif
+//#endif
 
 #if DBG
 

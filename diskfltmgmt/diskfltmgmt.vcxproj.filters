@@ -33,13 +33,10 @@
     </ResourceCompile>
   </ItemGroup>
   <ItemGroup>
-    <None Include="..\DistDriver\amd64\DiskFilter.sys" />
-    <None Include="..\DistDriver\i386\DiskFilter.sys" />
+    <None Include="..\DistDriver\i386\diskflt.sys" />
+    <None Include="..\DistDriver\amd64\diskflt.sys" />
   </ItemGroup>
   <ItemGroup>
-    <Image Include="icon1.ico">
-      <Filter>Resource Files</Filter>
-    </Image>
     <Image Include="diskfltmgmt.ico">
       <Filter>Resource Files</Filter>
     </Image>
