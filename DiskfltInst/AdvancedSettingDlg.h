@@ -45,4 +45,5 @@ public:
 	afx_msg void OnBnClickedThawspaceSelectall();
 	afx_msg void OnBnClickedThawspaceUnhide();
 	afx_msg void OnBnClickedThawspaceHide();
+	afx_msg void OnBnClickedSavedataManage();
 };

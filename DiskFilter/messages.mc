@@ -174,3 +174,19 @@ SymbolicName=MSG_DIRECT_UNMOUNT_OK
 Language=English
 Protected volume %2 unmount success.
 .
+
+MessageId=0x0015
+Facility=Driver
+Severity=Informational
+SymbolicName=MSG_SET_SAVEDATA_OK
+Language=English
+The data on volume %2 will be saved at shutdown.
+.
+
+MessageId=0x0016
+Facility=Driver
+Severity=Informational
+SymbolicName=MSG_CANCEL_SAVEDATA_OK
+Language=English
+The data on volume %2 will not be saved on shutdown.
+.

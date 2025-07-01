@@ -19,6 +19,12 @@ OnDiskFilterDispatchControl(
 	NTSTATUS *Status);
 
 BOOLEAN
+OnDiskFilterDispatchShutdown(
+	PDEVICE_OBJECT DeviceObject,
+	PIRP Irp,
+	NTSTATUS *Status);
+
+BOOLEAN
 OnDiskFilterReadWrite(
 	IN PUNICODE_STRING PhysicalDeviceName,
 	IN ULONG DeviceType,

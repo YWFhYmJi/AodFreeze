@@ -942,10 +942,7 @@ NTSTATUS ReadRegString(PUNICODE_STRING RegPath, PWCHAR KeyName, PWCHAR Buffer, U
 {
 	HANDLE	keyHandle;
 	OBJECT_ATTRIBUTES	objectAttributes;
-	ULONG		ulResult;
 	NTSTATUS	status;
-
-	LogInfo("Reading registry path %wZ\\%ls\n", RegPath, KeyName);
 
 	InitializeObjectAttributes(&objectAttributes,
 		RegPath,
@@ -953,13 +950,9 @@ NTSTATUS ReadRegString(PUNICODE_STRING RegPath, PWCHAR KeyName, PWCHAR Buffer, U
 		NULL,
 		NULL);
 
-	status = ZwCreateKey(&keyHandle,
+	status = ZwOpenKey(&keyHandle,
 		KEY_READ,
-		&objectAttributes,
-		0,
-		NULL,
-		REG_OPTION_NON_VOLATILE,
-		&ulResult);
+		&objectAttributes);
 
 	if (NT_SUCCESS(status))
 	{
@@ -1002,13 +995,66 @@ NTSTATUS ReadRegString(PUNICODE_STRING RegPath, PWCHAR KeyName, PWCHAR Buffer, U
 	return status;
 }
 
+NTSTATUS ReadRegDword(PUNICODE_STRING RegPath, PWCHAR KeyName, PDWORD Value)
+{
+	HANDLE	keyHandle;
+	OBJECT_ATTRIBUTES	objectAttributes;
+	NTSTATUS	status;
+
+	InitializeObjectAttributes(&objectAttributes,
+		RegPath,
+		OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+		NULL,
+		NULL);
+
+	status = ZwOpenKey(&keyHandle,
+		KEY_READ,
+		&objectAttributes);
+
+	if (NT_SUCCESS(status))
+	{
+		UNICODE_STRING keyName;
+		RtlInitUnicodeString(&keyName, KeyName);
+		ULONG NeedSize = 0;
+		status = ZwQueryValueKey(keyHandle, &keyName, KeyValuePartialInformation, NULL, 0, &NeedSize);
+		if (NeedSize > 0)
+		{
+			PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)__malloc(NeedSize);
+			if (info)
+			{
+				ULONG CurSize = 0;
+				status = ZwQueryValueKey(keyHandle, &keyName, KeyValuePartialInformation, info, NeedSize, &CurSize);
+				if (NT_SUCCESS(status))
+				{
+					if (info->Type == REG_DWORD)
+					{
+						*Value = 0;
+						RtlCopyMemory(Value, info->Data, 4);
+					}
+					else
+					{
+						status = STATUS_UNSUCCESSFUL;
+					}
+				}
+				__free(info);
+			}
+			else
+			{
+				status = STATUS_INSUFFICIENT_RESOURCES;
+			}
+		}
+
+		ZwClose(keyHandle);
+	}
+	return status;
+}
+
 NTSTATUS ReadLinkTarget(PUNICODE_STRING LinkPath, PUNICODE_STRING LinkTarget, PULONG ReturnedLength)
 {
 	HANDLE	linkHandle;
 	OBJECT_ATTRIBUTES	objectAttributes;
 	NTSTATUS	status;
 
-	LogInfo("Reading symbloic link %wZ\n", LinkPath);
 	InitializeObjectAttributes(&objectAttributes,
 		LinkPath,
 		OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
@@ -1204,6 +1250,28 @@ NTSTATUS UnmountVolume(WCHAR VolumeLetter)
 	return status;
 }
 
+void InitDisplay()
+{
+	// Windows 7以下需要做额外的初始化
+	if (InbvIsBootDriverInstalled())
+	{
+		InbvAcquireDisplayOwnership();
+		InbvResetDisplay();
+		InbvSetTextColor(15);
+		InbvInstallDisplayStringFilter(0);
+		InbvEnableDisplayString(1);
+		InbvSetScrollRegion(0, 0, 639, 475);
+	}
+}
+
+void DisplayString(PWCHAR String)
+{
+	UNICODE_STRING str = { 0 };
+	str.Buffer = String;
+	str.Length = str.MaximumLength = wcslen(String) * sizeof(WCHAR);
+	ZwDisplayString(&str);
+}
+
 #pragma pack(push, 1)
 // Starting at offset 36 into the BPB, this is the structure for a FAT32 FS
 typedef struct _BPBFAT32_struct {
@@ -1249,21 +1317,6 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	UINT ssa;
 	IO_STATUS_BLOCK IoStatus = { 0 };
 	LARGE_INTEGER Offset = { 0 };
-
-	LogInfo("Initializating disk file with size %llu\n", FileSize);
-	ULONG BufferSize = 20 * 1024 * 1024; // 20MB
-	PUCHAR Buffer = (PUCHAR)__malloc(BufferSize);
-	memset(Buffer, 0, BufferSize);
-	ULONGLONG Cur = 0;
-	while (Cur < FileSize)
-	{
-		ULONG WriteSize = min(BufferSize, FileSize - Cur);
-		Offset.QuadPart = Cur;
-		ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, Buffer, WriteSize, &Offset, NULL);
-		Cur += WriteSize;
-	}
-	__free(Buffer);
-	LogInfo("Fill file ok\n");
 
 	memset(sectorBuf0, 0x00, 0x200);
 	memset(&bpb, 0, sizeof(bpb));

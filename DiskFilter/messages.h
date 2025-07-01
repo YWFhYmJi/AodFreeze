@@ -222,3 +222,21 @@
 //
 #define MSG_DIRECT_UNMOUNT_OK            ((NTSTATUS)0x40070014L)
 
+//
+// MessageId: MSG_SET_SAVEDATA_OK
+//
+// MessageText:
+//
+// The data on volume %2 will be saved at shutdown.
+//
+#define MSG_SET_SAVEDATA_OK              ((NTSTATUS)0x40070015L)
+
+//
+// MessageId: MSG_CANCEL_SAVEDATA_OK
+//
+// MessageText:
+//
+// The data on volume %2 will not be saved on shutdown.
+//
+#define MSG_CANCEL_SAVEDATA_OK           ((NTSTATUS)0x40070016L)
+

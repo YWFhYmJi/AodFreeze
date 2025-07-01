@@ -57,6 +57,12 @@
     <ClInclude Include="AddMountDlg.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="SaveDataManageDlg.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AddSaveDataDlg.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DiskfltInst.cpp">
@@ -84,6 +90,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="AddMountDlg.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SaveDataManageDlg.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AddSaveDataDlg.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

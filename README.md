@@ -1,5 +1,5 @@
 # AodFreeze
-傲盾还原v3.4 修改自 [傲盾还原 By dbgger@gmail.com](https://code.google.com/p/diskflt) \
+傲盾还原v3.5 修改自 [傲盾还原 By dbgger@gmail.com](https://code.google.com/p/diskflt) \
 支持Windows XP SP2及以上版本的32位、64位系统 \
 支持FAT、NTFS文件系统 \
 自动保护MBR、GPT的分区表（保护盘分区表无法修改） \
@@ -14,6 +14,11 @@
 5. **解冻空间从已有文件添加时，必须添加硬盘上原有的文件且可以被访问，如果不存在会自动尝试创建，文件作为解冻空间使用后不能被其它程序访问**
 
 ## 更新日志
+
+v3.5
+- 修复安装后蓝屏的小概率问题
+- 增加ThawSpace初始化时显示进度
+- 增加关机时保存数据功能
 
 v3.4
 - 修复了很多BUG，旧版本有较大BUG，请不要使用

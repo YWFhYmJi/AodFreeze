@@ -1171,6 +1171,7 @@ Return Value:
 
 {
 	PDEVICE_EXTENSION  deviceExtension = DeviceObject->DeviceExtension;
+	NTSTATUS mystatus;
 
 	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
 		return STATUS_SUCCESS;
@@ -1182,6 +1183,10 @@ Return Value:
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 		return STATUS_SUCCESS;
 	}
+
+	// add by tanwen 
+	if (DeviceObject == g_cdo && OnDiskFilterDispatchShutdown(DeviceObject, Irp, &mystatus))
+		return mystatus;
 
 	//
 	// Set current stack back one.

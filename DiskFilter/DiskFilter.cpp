@@ -8,19 +8,10 @@
 #include <ntddscsi.h>
 #include <wchar.h>
 #include <ntdddisk.h>
+#include <ntstrsafe.h>
 #include "messages.h"
 #include "ThawSpace.h"
 #include "DirectDisk.h"
-
-// 引入函数，用于在屏幕上显示文字
-EXTERN_C VOID InbvAcquireDisplayOwnership(VOID);
-EXTERN_C VOID InbvResetDisplay(VOID);
-EXTERN_C INT InbvSetTextColor(INT color); //IRBG
-EXTERN_C VOID InbvDisplayString(PSZ text);
-EXTERN_C VOID InbvSolidColorFill(ULONG left, ULONG top, ULONG width, ULONG height, ULONG color);
-EXTERN_C VOID InbvSetScrollRegion(ULONG left, ULONG top, ULONG width, ULONG height);
-EXTERN_C VOID InbvInstallDisplayStringFilter(ULONG b);
-EXTERN_C VOID InbvEnableDisplayString(ULONG b);
 
 // 保护硬盘特定扇区所用到的信息
 typedef struct _DISK_INFO
@@ -35,6 +26,10 @@ UNICODE_STRING ConfigPath;
 PFILE_OBJECT ConfigFileObject;
 VOLUME_INFO ConfigVolume;
 PRETRIEVAL_POINTERS_BUFFER ConfigVcnPairs;
+
+// 不使用Inbv显示信息，兼容一些显卡驱动
+DWORD DisableStartupMessage;
+DWORD DisableShutdownMessage;
 
 PDEVICE_OBJECT LowerDeviceObject[256]; // 硬盘的下层设备
 PDEVICE_OBJECT FilterDevice; // 当前过滤器设备
@@ -846,6 +841,7 @@ void InitProtectVolumes()
 
 					if (NT_SUCCESS(status))
 					{
+						ProtectVolumeList[Cur].CanSaveData = TRUE;
 						VaildVolumeCount = Cur + 1;
 						swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
 						LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_OK, strMsg, wcslen(strMsg));
@@ -1008,13 +1004,9 @@ void CheckThawSpace()
 				{
 					if (!NeedInit)
 					{
-						InbvAcquireDisplayOwnership();
-						InbvResetDisplay();
-						InbvSetTextColor(15);
-						InbvInstallDisplayStringFilter(0);
-						InbvEnableDisplayString(1);
-						InbvSetScrollRegion(0, 0, 639, 475);
-						InbvDisplayString("DiskFilter is initializing ThawSpace...\nPlease do not shut down or restart the computer.\n");
+						if (!DisableStartupMessage)
+							InitDisplay();
+						DisplayString(L"DiskFilter is initializing ThawSpace...\nPlease do not shut down or restart the computer.\n");
 						NeedInit = TRUE;
 					}
 					status = ZwCreateFile(
@@ -1049,13 +1041,42 @@ void CheckThawSpace()
 							);
 
 							LogInfo("ThawSpace %wZ: File not found, initializing disk file.\n", &file_name);
-							CHAR Buf[256];
-							strcpy(Buf, "Initializing ThawSpace volume ?\n");
-							*strchr(Buf, '?') = (UCHAR)(((USHORT)Config.ThawSpacePath[i][MAX_PATH]) & ~DISKFILTER_THAWSPACE_HIDE);
+							WCHAR VolumeLetter = (WCHAR)(((USHORT)Config.ThawSpacePath[i][MAX_PATH]) & ~DISKFILTER_THAWSPACE_HIDE);
 							// 写入初始化标记，防止因为错误导致无限重启初始化
 							Config.ThawSpacePath[i][0] |= DISKFILTER_THAWSPACE_HIDE;
-							InbvDisplayString(Buf);
-							FormatFAT32FileSystem(file_handle, FileSize, "ThawSpace");
+							WCHAR Buf[256];
+							swprintf_s(Buf, 256, L"Initializing ThawSpace volume %lc", VolumeLetter);
+							DisplayString(Buf);
+							{
+								LogInfo("Initializating disk file with size %llu\n", FileSize);
+								IO_STATUS_BLOCK IoStatus = { 0 };
+								LARGE_INTEGER Offset = { 0 };
+								ULONG BufferSize = 20 * 1024 * 1024; // 20MB
+								PUCHAR Buffer = (PUCHAR)__malloc(BufferSize);
+								memset(Buffer, 0, BufferSize);
+								ULONGLONG Cur = 0;
+								int LastProgress = -1;
+								while (Cur < FileSize)
+								{
+									ULONG WriteSize = min(BufferSize, FileSize - Cur);
+									Offset.QuadPart = Cur;
+									ZwWriteFile(file_handle, NULL, NULL, NULL, &IoStatus, Buffer, WriteSize, &Offset, NULL);
+									Cur += WriteSize;
+									int CurProgress = int(100 * Cur / FileSize);
+									if (LastProgress != CurProgress)
+									{
+										LastProgress = CurProgress;
+										swprintf_s(Buf, 256, L"\rInitializing ThawSpace volume %c... Progress: %d%%", VolumeLetter, CurProgress);
+										DisplayString(Buf);
+									}
+								}
+								__free(Buffer);
+								LogInfo("Fill file ok\n");
+								FormatFAT32FileSystem(file_handle, FileSize, "ThawSpace");
+								wcscpy(Buf, L"\rFinished initializing ThawSpace volume ?          \n");
+								*wcsrchr(Buf, L'?') = VolumeLetter;
+								DisplayString(Buf);
+							}
 							FileChanged = TRUE;
 							ConfigChanged = TRUE;
 						}
@@ -1073,7 +1094,7 @@ void CheckThawSpace()
 
 		if (FileChanged)
 		{
-			InbvDisplayString("Initialization finished.\n");
+			DisplayString(L"Initialization finished.\n");
 			if (*NtBuildNumber <= 3790) // 直接重新启动会在Windows XP上提示未正常关闭，删除bootstat.dat文件后再重新启动
 				SafeReboot();
 			else
@@ -1264,7 +1285,7 @@ ULONGLONG GetRealSectorForRead(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, PULO
 	if (DPBitmap_Test(volumeInfo->BitmapRedirect, orgIndex))
 	{
 		// 找到重定向到哪里, 并返回
-		RedirectTable_Lookup(&volumeInfo->RedirectMap, orgIndex, &mapIndex, nextCount);
+		RedirectTable_Lookup(&volumeInfo->RedirectMap, orgIndex, &mapIndex, nextCount, NULL);
 	}
 	return mapIndex;
 }
@@ -1272,9 +1293,9 @@ ULONGLONG GetRealSectorForRead(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, PULO
 // 添加重定向记录
 __inline void AddRedirectRecord(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULONGLONG realIndex, ULONG sectorCount)
 {
-	RedirectTable_Insert(&volumeInfo->RedirectMap, orgIndex, realIndex, sectorCount);
+	RedirectTable_Insert(&volumeInfo->RedirectMap, orgIndex, realIndex, sectorCount, NULL);
 	if (AllowDirectMount)
-		RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, realIndex, orgIndex, sectorCount);
+		RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, realIndex, orgIndex, sectorCount, NULL);
 }
 
 // 更新重定向记录 把重定向到orgIndex的记录修改为realIndex（realIndex等于-1时删除记录）
@@ -1286,7 +1307,7 @@ void UpdateRedirectRecord(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULONGLONG
 	for (ULONG i = 0; i < sectorCount; i++)
 	{
 		ULONGLONG mapIndex = (ULONGLONG)-1;
-		RedirectTable_Lookup(&volumeInfo->ReverseRedirectMap, orgIndex + i, &mapIndex, NULL);
+		RedirectTable_Lookup(&volumeInfo->ReverseRedirectMap, orgIndex + i, &mapIndex, NULL, NULL);
 		if (mapIndex != -1)
 		{
 			if (prevSector == -1 || mapIndex != prevSector + 1)
@@ -1341,7 +1362,7 @@ ULONGLONG GetRealSectorForWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, PUL
 	if (DPBitmap_Test(volumeInfo->BitmapRedirect, orgIndex))
 	{
 		// 找到重定向到哪里, 并返回
-		RedirectTable_Lookup(&volumeInfo->RedirectMap, orgIndex, &mapIndex, nextCount);
+		RedirectTable_Lookup(&volumeInfo->RedirectMap, orgIndex, &mapIndex, nextCount, NULL);
 	}
 	else
 	{
@@ -1415,6 +1436,7 @@ NTSTATUS HandleDiskRequest(
 
 		if (-1 == realIndex)
 		{
+			volumeInfo->CanSaveData = FALSE;
 			if (!isFirstBlock)
 			{
 				status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], majorFunction, volumeInfo->StartOffset + prevOffset,
@@ -1531,7 +1553,7 @@ ULONGLONG GetRealSectorForDirectWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgInde
 	if (DPBitmap_Test(volumeInfo->BitmapRedirectUsed, orgIndex))
 	{
 		ULONGLONG oldSector = -1; // 原扇区
-		RedirectTable_Lookup(&volumeInfo->ReverseRedirectMap, orgIndex, &oldSector, nextCount);
+		RedirectTable_Lookup(&volumeInfo->ReverseRedirectMap, orgIndex, &oldSector, nextCount, NULL);
 		if (oldSector == -1) // 之前是空闲状态，无需处理
 		{
 			return -1;
@@ -1662,7 +1684,7 @@ NTSTATUS PrepareForDirectWriteRequest(
 			// 判断是否要加入重定向列表和反向重定向列表
 			if (prevModifyType == 1)
 			{
-				RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, prevStart, -1, totalProcessBytes / bytesPerSector);
+				RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, prevStart, -1, totalProcessBytes / bytesPerSector, NULL);
 			}
 			else if (prevModifyType == 2)
 			{
@@ -1690,7 +1712,7 @@ NTSTATUS PrepareForDirectWriteRequest(
 			// 判断是否要加入重定向列表和反向重定向列表
 			if (prevModifyType == 1)
 			{
-				RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, prevStart, -1, totalProcessBytes / bytesPerSector);
+				RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, prevStart, -1, totalProcessBytes / bytesPerSector, NULL);
 			}
 			else if (prevModifyType == 2)
 			{
@@ -1737,6 +1759,188 @@ NTSTATUS HandleDirectDiskRequest(
 	return status;
 }
 
+// 处理保存数据的操作
+void SaveVolumeData(PVOLUME_INFO volumeInfo)
+{
+	if (!volumeInfo->CanSaveData)
+	{
+		LogWarn("Cannot save data on volume (%lu,%lu)\n", volumeInfo->DiskNumber, volumeInfo->PartitionNumber);
+		return;
+	}
+	WCHAR VolName[50];
+	if (volumeInfo->Volume)
+	{
+		VolName[0] = volumeInfo->Volume;
+		VolName[1] = L'\0';
+	}
+	else
+	{
+		swprintf_s(VolName, 50, L"(%lu,%lu)", volumeInfo->DiskNumber, volumeInfo->PartitionNumber);
+	}
+	LogInfo("Saving data on volume %ls...\n", VolName);
+	WCHAR Buf[256];
+	swprintf_s(Buf, 256, L"Saving data on volume %ls", VolName);
+	DisplayString(Buf);
+	PDP_BITMAP BitmapDepends = NULL;
+	NTSTATUS status = DPBitmap_Create(&BitmapDepends, volumeInfo->SectorCount, BITMAP_SLOT_SIZE);
+	if (!NT_SUCCESS(status))
+	{
+		LogWarn("Failed to create bitmap, error code=0x%.8X\n", status);
+		swprintf_s(Buf, 256, L"\rFailed to save data on volume %ls. Error code=0x%.8X\n", VolName, status);
+		DisplayString(Buf);
+		return;
+	}
+	for (PREDIRECT_TABLE_NODE Iterator = RedirectTable_NextIterator(&volumeInfo->RedirectMap, NULL);
+		Iterator;
+		Iterator = RedirectTable_NextIterator(&volumeInfo->RedirectMap, Iterator))
+	{
+		for (ULONG i = 0; i < Iterator->Length; i++)
+		{
+			if (DPBitmap_Test(volumeInfo->BitmapRedirect, Iterator->NewStart + i))
+				DPBitmap_Set(BitmapDepends, Iterator->NewStart + i, TRUE);
+		}
+	}
+	typedef struct
+	{
+		PREDIRECT_TABLE_NODE Iterator;
+		LIST_ENTRY ListEntry;
+	} REDIRECT_QUEUE_ITEM;
+	LIST_ENTRY RedirectQueue;
+	InitializeListHead(&RedirectQueue);
+	for (PREDIRECT_TABLE_NODE Iterator = RedirectTable_NextIterator(&volumeInfo->RedirectMap, NULL);
+		Iterator;
+		Iterator = RedirectTable_NextIterator(&volumeInfo->RedirectMap, Iterator))
+	{
+		BOOLEAN Flag = TRUE;
+		for (ULONG Index = 0; Index < Iterator->Length; Index++)
+		{
+			if (DPBitmap_Test(BitmapDepends, Iterator->OrigStart + Index))
+			{
+				Flag = FALSE;
+				break;
+			}
+		}
+		if (Flag)
+		{
+			REDIRECT_QUEUE_ITEM *item = (REDIRECT_QUEUE_ITEM *)__malloc(sizeof(REDIRECT_QUEUE_ITEM));
+			if (!item)
+			{
+				LogWarn("Failed to allocate memory for queue item\n");
+				DPBitmap_Free(BitmapDepends);
+				while (!IsListEmpty(&RedirectQueue))
+				{
+					PLIST_ENTRY Entry = RemoveHeadList(&RedirectQueue);
+					REDIRECT_QUEUE_ITEM *tmpItem = CONTAINING_RECORD(Entry, REDIRECT_QUEUE_ITEM, ListEntry);
+					__free(tmpItem);
+				}
+				swprintf_s(Buf, 256, L"\rFailed to save data on volume %ls. Failed to allocate memory.\n", VolName);
+				DisplayString(Buf);
+				return;
+			}
+			item->Iterator = Iterator;
+			InitializeListHead(&item->ListEntry);
+			InsertTailList(&RedirectQueue, &item->ListEntry);
+		}
+	}
+	ULONGLONG TotalRedirectSectors = DPBitmap_Count(volumeInfo->BitmapRedirect, TRUE);
+	int LastProgress = -1;
+	while (!IsListEmpty(&RedirectQueue))
+	{
+		PLIST_ENTRY Entry = RemoveHeadList(&RedirectQueue);
+		REDIRECT_QUEUE_ITEM *Item = CONTAINING_RECORD(Entry, REDIRECT_QUEUE_ITEM, ListEntry);
+		ULONG Length = Item->Iterator->Length * volumeInfo->BytesPerSector;
+		char * buff = (char *)__malloc(Length);
+		if (buff)
+		{
+			status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_READ, volumeInfo->StartOffset + Item->Iterator->NewStart * volumeInfo->BytesPerSector, buff, Length, TRUE);
+			if (NT_SUCCESS(status))
+			{
+				status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_WRITE, volumeInfo->StartOffset + Item->Iterator->OrigStart * volumeInfo->BytesPerSector, buff, Length, TRUE);
+				if (!NT_SUCCESS(status))
+				{
+					LogErr("Write sector failed (StartOffset=%llu,Length=%lu), error code=0x%.8X\n", volumeInfo->StartOffset / volumeInfo->BytesPerSector + Item->Iterator->OrigStart, Item->Iterator->Length, status);
+				}
+			}
+			else
+			{
+				LogErr("Read sector failed (StartOffset=%llu,Length=%lu), error code=0x%.8X\n", volumeInfo->StartOffset / volumeInfo->BytesPerSector + Item->Iterator->NewStart, Item->Iterator->Length, status);
+			}
+			__free(buff);
+		}
+		else
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+		}
+		if (!NT_SUCCESS(status))
+		{
+			swprintf_s(Buf, 256, L"\rSave sector %llu->%llu (%lu) on volume %ls failed. Error code=0x%.8X\n", Item->Iterator->NewStart, Item->Iterator->OrigStart, Item->Iterator->Length, VolName, status);
+			DisplayString(Buf);
+		}
+		for (ULONG i = 0; i < Item->Iterator->Length; i++)
+		{
+			DPBitmap_Set(volumeInfo->BitmapRedirect, Item->Iterator->OrigStart + i, FALSE);
+			ULONGLONG NewIndex = Item->Iterator->NewStart + i;
+			if (DPBitmap_Test(volumeInfo->BitmapRedirect, NewIndex))
+				DPBitmap_Set(BitmapDepends, NewIndex, FALSE);
+		}
+		for (ULONG i = 0; i < Item->Iterator->Length; i++)
+		{
+			ULONGLONG NewIndex = Item->Iterator->NewStart + i;
+			if (DPBitmap_Test(volumeInfo->BitmapRedirect, NewIndex))
+			{
+				ULONGLONG MapIndex = -1;
+				ULONGLONG NextCount = 0;
+				PREDIRECT_TABLE_NODE NewIterator = NULL;
+				RedirectTable_Lookup(&volumeInfo->RedirectMap, NewIndex, &MapIndex, &NextCount, &NewIterator);
+				if (NewIterator)
+				{
+					BOOLEAN Flag = TRUE;
+					for (ULONG Index = 0; Index < NewIterator->Length; Index++)
+					{
+						if (DPBitmap_Test(BitmapDepends, NewIterator->OrigStart + Index))
+						{
+							Flag = FALSE;
+							break;
+						}
+					}
+					if (Flag)
+					{
+						REDIRECT_QUEUE_ITEM *item = (REDIRECT_QUEUE_ITEM *)__malloc(sizeof(REDIRECT_QUEUE_ITEM));
+						if (item)
+						{
+							item->Iterator = NewIterator;
+							InitializeListHead(&item->ListEntry);
+							InsertTailList(&RedirectQueue, &item->ListEntry);
+						}
+						else
+						{
+							LogErr("Failed to allocate memory for queue item\n");
+						}
+					}
+				}
+				else
+				{
+					LogErr("No redirect matched with sector %llu\n", NewIndex);
+				}
+				i += NextCount;
+			}
+		}
+		RedirectTable_DeleteIterator(&volumeInfo->RedirectMap, Item->Iterator);
+		__free(Item);
+		ULONGLONG CurrentCount = DPBitmap_Count(volumeInfo->BitmapRedirect, TRUE);
+		int CurProgress = int(100 * (TotalRedirectSectors - CurrentCount) / TotalRedirectSectors);
+		if (CurProgress != LastProgress)
+		{
+			LastProgress = CurProgress;
+			swprintf_s(Buf, 256, L"\rSaving data on volume %ls... Progress: %d%%", VolName, CurProgress);
+			DisplayString(Buf);
+		}
+	}
+	DPBitmap_Free(BitmapDepends);
+	swprintf_s(Buf, 256, L"\rFinished saving data on volume %ls         \n", VolName);
+	DisplayString(Buf);
+}
+
 // 读写操作线程
 void ThreadReadWrite(PVOID Context)
 {
@@ -1779,6 +1983,14 @@ void ThreadReadWrite(PVOID Context)
 		{
 			PsTerminateSystemThread(STATUS_SUCCESS);
 			return;
+		}
+		//保存数据
+		if (volume_info->SavingData)
+		{
+			SaveVolumeData(volume_info);
+			volume_info->SavingData = FALSE;
+			volume_info->CanSaveData = FALSE;
+			KeSetEvent(&volume_info->FinishSaveDataEvent, (KPRIORITY)0, FALSE);
 		}
 		//从请求队列的首部拿出一个请求来准备处理，这里使用了自旋锁机制，所以不会有冲突
 		while (ReqEntry = ExInterlockedRemoveHeadList(
@@ -2317,6 +2529,75 @@ OnDiskFilterDispatchControl(
 							*Status = STATUS_BUFFER_TOO_SMALL;
 						}
 						break;
+					case DISKFILTER_CONTROL_SET_SAVE_DATA:
+					{
+						DISKFILTER_SAVEDATA SaveDataInfo;
+						RtlCopyMemory(&SaveDataInfo, &Data->Config, sizeof(SaveDataInfo));
+						PVOLUME_INFO ProtectedVolume = FindProtectVolume(SaveDataInfo.DiskNumber, SaveDataInfo.PartitionNumber);
+						if (ProtectedVolume == NULL || !ProtectedVolume->CanSaveData)
+						{
+							*Status = STATUS_NOT_FOUND;
+							break;
+						}
+						if (ProtectedVolume->ShutdownSaveData || ProtectedVolume->SavingData)
+						{
+							*Status = STATUS_OBJECT_NAME_COLLISION;
+							break;
+						}
+						InterlockedExchange8((PCHAR)&ProtectedVolume->ShutdownSaveData, TRUE);
+						*Status = STATUS_SUCCESS;
+						WCHAR strMsg[512];
+						swprintf_s(strMsg, 512, L"(%lu,%lu)", SaveDataInfo.DiskNumber, SaveDataInfo.PartitionNumber);
+						LogErrorMessageWithString(FilterDevice, MSG_SET_SAVEDATA_OK, strMsg, wcslen(strMsg));
+						break;
+					}
+					case DISKFILTER_CONTROL_CANCEL_SAVE_DATA:
+					{
+						DISKFILTER_SAVEDATA SaveDataInfo;
+						RtlCopyMemory(&SaveDataInfo, &Data->Config, sizeof(SaveDataInfo));
+						PVOLUME_INFO ProtectedVolume = FindProtectVolume(SaveDataInfo.DiskNumber, SaveDataInfo.PartitionNumber);
+						if (ProtectedVolume == NULL || !ProtectedVolume->CanSaveData)
+						{
+							*Status = STATUS_NOT_FOUND;
+							break;
+						}
+						InterlockedExchange8((PCHAR)&ProtectedVolume->ShutdownSaveData, FALSE);
+						*Status = STATUS_SUCCESS;
+						WCHAR strMsg[512];
+						swprintf_s(strMsg, 512, L"(%lu,%lu)", SaveDataInfo.DiskNumber, SaveDataInfo.PartitionNumber);
+						LogErrorMessageWithString(FilterDevice, MSG_CANCEL_SAVEDATA_OK, strMsg, wcslen(strMsg));
+						break;
+					}
+					case DISKFILTER_CONTROL_GET_SAVE_DATA:
+						if (OutBufferLength >= sizeof(DISKFILTER_SAVEDATA_STATUS))
+						{
+							DISKFILTER_SAVEDATA_STATUS CurStatus;
+							RtlZeroMemory(&CurStatus, sizeof(CurStatus));
+							PDEVICE_OBJECT DeviceObject;
+							ULONG TotalCount = 0;
+							DeviceObject = FilterDevice->DriverObject->DeviceObject;
+							for (UINT i = 0; i < VaildVolumeCount; i++)
+							{
+								if (ProtectVolumeList[i].ShutdownSaveData && ProtectVolumeList[i].CanSaveData)
+								{
+									if (TotalCount < sizeof(CurStatus.SaveDataVolume) / sizeof(*CurStatus.SaveDataVolume))
+									{
+										CurStatus.SaveDataVolume[TotalCount].DiskNumber = ProtectVolumeList[i].DiskNumber;
+										CurStatus.SaveDataVolume[TotalCount].PartitionNumber = ProtectVolumeList[i].PartitionNumber;
+										TotalCount++;
+									}
+								}
+							}
+							CurStatus.SaveDataCount = TotalCount;
+							RtlCopyMemory(SystemBuffer, &CurStatus, sizeof(CurStatus));
+							info = sizeof(CurStatus);
+							*Status = STATUS_SUCCESS;
+						}
+						else
+						{
+							*Status = STATUS_BUFFER_TOO_SMALL;
+						}
+						break;
 					default:
 						break;
 					}
@@ -2328,6 +2609,51 @@ OnDiskFilterDispatchControl(
 	}
 	Irp->IoStatus.Status = *Status;
 	Irp->IoStatus.Information = info;
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return TRUE;
+}
+
+// 处理关机事件
+BOOLEAN
+OnDiskFilterDispatchShutdown(
+	PDEVICE_OBJECT DeviceObject,
+	PIRP Irp,
+	NTSTATUS *Status)
+{
+	UNREFERENCED_PARAMETER(DeviceObject);
+	PIO_STACK_LOCATION StackLocation = IoGetCurrentIrpStackLocation(Irp);
+	if (StackLocation->MajorFunction == IRP_MJ_SHUTDOWN)
+	{
+		BOOLEAN NeedSaveData = FALSE;
+		for (UINT i = 0; i < VaildVolumeCount; i++)
+		{
+			if (ProtectVolumeList[i].ShutdownSaveData)
+			{
+				if (!NeedSaveData)
+				{
+					if (!DisableShutdownMessage)
+						InitDisplay();
+					DisplayString(L"DiskFilter is saving data...\nPlease do not shut down or restart the computer.\n");
+					NeedSaveData = TRUE;
+				}
+				KeInitializeEvent(&ProtectVolumeList[i].FinishSaveDataEvent, SynchronizationEvent, FALSE);
+				InterlockedExchange8((PCHAR)&ProtectVolumeList[i].SavingData, TRUE);
+				KeSetEvent(
+					&ProtectVolumeList[i].RequestEvent,
+					(KPRIORITY)0,
+					FALSE);
+				KeWaitForSingleObject(
+					&ProtectVolumeList[i].FinishSaveDataEvent,
+					Executive,
+					KernelMode,
+					FALSE,
+					NULL
+				);
+			}
+		}
+	}
+	Irp->IoStatus.Status = *Status = STATUS_SUCCESS;
+	Irp->IoStatus.Information = 0;
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 	return TRUE;
 }
@@ -2456,6 +2782,7 @@ void DriverReinit(PDRIVER_OBJECT DriverObject, PVOID Context, ULONG Count)
 		InitProtectVolumes();
 		InitProtectDisks();
 		StartProtect();
+		IoRegisterLastChanceShutdownNotification(FilterDevice);
 
 		LogErrorMessage(FilterDevice, MSG_PROTECTION_ENABLED);
 	}
@@ -2569,6 +2896,8 @@ OnDiskFilterInitialization(
 	AllowLoadDriver = TRUE;
 	AllowDirectMount = FALSE;
 	DirectDiskCount = 0;
+	DisableStartupMessage = 0;
+	DisableShutdownMessage = 0;
 
 	WCHAR strAppend[] = L"\\Parameters";
 	ULONG TotalLen = RegistryPath->Length / 2 + wcslen(strAppend) + 10;
@@ -2594,6 +2923,9 @@ OnDiskFilterInitialization(
 				status = STATUS_INSUFFICIENT_RESOURCES;
 			}
 		}
+		ReadRegDword(&uniRegPath, L"DisableStartupMessage", &DisableStartupMessage);
+		ReadRegDword(&uniRegPath, L"DisableShutdownMessage", &DisableShutdownMessage);
+		__free(strRegPath);
 	}
 	else
 	{

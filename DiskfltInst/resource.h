@@ -13,6 +13,8 @@
 #define IDD_ADDTHAWSPACE                210
 #define IDD_MOUNTMANAGE                 211
 #define IDD_ADDMOUNT                    212
+#define IDD_SAVEDATAMANAGE              213
+#define IDD_ADDSAVEDATA                 214
 #define IDC_VOLUMELIST                  1000
 #define IDC_INSTALLSYS                  1001
 #define IDC_APPLY                       1002
@@ -58,6 +60,10 @@
 #define IDC_THAWSPACE_SELECTALL         1051
 #define IDC_THAWSPACE_UNHIDE            1052
 #define IDC_THAWSPACE_HIDE              1053
+#define IDC_SAVEDATA_MANAGE             1057
+#define IDC_ADD_SAVEDATA                1058
+#define IDC_DELETE_SAVEDATA             1059
+#define IDC_SAVEDATA_LIST               1060
 
 // Next default values for new objects
 // 
@@ -65,7 +71,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        212
 #define _APS_NEXT_COMMAND_VALUE         32772
-#define _APS_NEXT_CONTROL_VALUE         1057
+#define _APS_NEXT_CONTROL_VALUE         1061
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif

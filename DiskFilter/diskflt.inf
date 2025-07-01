@@ -4,8 +4,8 @@
 
 [Version]
 Signature="$WINDOWS NT$"
-Class=Sample ; TODO: edit Class
-ClassGuid={78A1C341-4539-11d3-B88D-00C04FAD5171} ; TODO: edit ClassGuid
+Class=DiskDrive
+ClassGuid={4d36e967-e325-11ce-bfc1-08002be10318}
 Provider=%ManufacturerName%
 CatalogFile=diskflt.cat
 DriverVer= ; TODO: set DriverVer in stampinf property pages
@@ -60,6 +60,7 @@ ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
 StartType      = 0               ; SERVICE_BOOT_START
 ErrorControl   = 0               ; SERVICE_ERROR_IGNORE
 ServiceBinary  = %12%\diskflt.sys
+AddReg         = diskflt_Parameters_AddReg
 
 
 [diskflt_EventLog_Inst]
@@ -71,6 +72,11 @@ AddReg = diskflt_EventLog_AddReg
 HKR,,EventMessageFile, 0x00020000,"%%SystemRoot%%\System32\IoLogMsg.dll;%%SystemRoot%%\System32\drivers\diskflt.sys"
 HKR,,TypesSupported, 0x00010001, 7
 
+
+[diskflt_Parameters_AddReg]
+HKR, Parameters, ConfigPath, 0x00000000, %24%\DFConfig.sys
+HKR, Parameters, DisableStartupMessage, 0x00010001, 0
+HKR, Parameters, DisableShutdownMessage, 0x00010001, 1
 
 [Strings]
 ManufacturerName="<Your manufacturer name>" ;TODO: Replace with your manufacturer name
