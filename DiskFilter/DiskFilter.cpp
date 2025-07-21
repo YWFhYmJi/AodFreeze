@@ -37,7 +37,7 @@ DISKFILTER_PROTECTION_CONFIG Config, NewConfig; // 当前保护配置、新配�
 ERESOURCE DriverListLock; // 驱动策略锁
 VOLUME_INFO ProtectVolumeList[256]; // 保护卷列表
 PVOLUME_INFO VolumeList[26]; // 盘符对应的保护卷
-UINT VaildVolumeCount; // 保护卷数量
+UINT ValidVolumeCount; // 保护卷数量
 DISK_INFO ProtectDiskList[256]; // 硬盘保护信息
 BOOLEAN IsProtect; // 是否在保护状态
 BOOLEAN AllowLoadDriver; // 是否允许加载驱动
@@ -48,7 +48,7 @@ UINT DirectDiskCount; // 已挂载的直接读写卷数量
 void ThreadReadWrite(PVOID Context);
 
 // 检查配置文件是否有效
-BOOLEAN IsVaildConfig(PDISKFILTER_PROTECTION_CONFIG Config)
+BOOLEAN IsValidConfig(PDISKFILTER_PROTECTION_CONFIG Config)
 {
 	// 头部不匹配
 	if (Config->Magic != DISKFILTER_CONFIG_MAGIC)
@@ -273,7 +273,7 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 
 	LogInfo("Magic=0x%.4X, Version=0x%.4X, Flags=%.2X\n", Conf->Magic, Conf->Version, Conf->ProtectionFlags);
 
-	if (!IsVaildConfig(Conf))
+	if (!IsValidConfig(Conf))
 		return STATUS_UNSUCCESSFUL;
 
 	RtlCopyMemory(RetConfig, Conf, sizeof(DISKFILTER_PROTECTION_CONFIG));
@@ -420,6 +420,8 @@ out:
 	{
 		DPBitmap_Free(volumeInfo->BitmapRedirect);
 		volumeInfo->BitmapRedirect = NULL;
+		DPBitmap_Free(volumeInfo->BitmapRedirectUsed);
+		volumeInfo->BitmapRedirectUsed = NULL;
 		DPBitmap_Free(volumeInfo->BitmapAllow);
 		volumeInfo->BitmapAllow = NULL;
 		DPBitmap_Free(volumeInfo->BitmapUsed);
@@ -532,7 +534,7 @@ void InitVolumeAllowList(PVOLUME_INFO volumeInfo)
 // 根据硬盘号和分区号获取保护卷
 PVOLUME_INFO FindProtectVolume(ULONG DiskNum, DWORD PartitionNum)
 {
-	for (UINT i = 0; i < VaildVolumeCount; i++)
+	for (UINT i = 0; i < ValidVolumeCount; i++)
 	{
 		if (ProtectVolumeList[i].DiskNumber == DiskNum && ProtectVolumeList[i].PartitionNumber == PartitionNum)
 			return &(ProtectVolumeList[i]);
@@ -770,7 +772,7 @@ void InitProtectDisks()
 		LogInfo("Protected disk: %hu\n", DiskNum);
 		if (NT_SUCCESS(GetDiskInfo(DiskNum, &ProtectDiskList[DiskNum])))
 		{
-			LogInfo("Found vaild disk %hu\n", DiskNum);
+			LogInfo("Found valid disk %hu\n", DiskNum);
 		}
 	}
 }
@@ -792,89 +794,84 @@ void InitProtectVolumes()
 			continue;
 		}
 
-		UINT Cur = VaildVolumeCount;
+		UINT Cur = ValidVolumeCount;
+		memset(&ProtectVolumeList[Cur], 0, sizeof(ProtectVolumeList[Cur]));
 		if (NT_SUCCESS(GetVolumeInfo(DiskNum, PartitionNum, &ProtectVolumeList[Cur])))
 		{
-			LogInfo("Found vaild volume on disk %hu partition %hu\n", DiskNum, PartitionNum);
-			if (NT_SUCCESS(InitVolumeLogicBitmap(&ProtectVolumeList[Cur])))
+			LogInfo("Found valid volume on disk %hu partition %hu\n", DiskNum, PartitionNum);
+			//初始化这个卷的请求处理队列
+			InitializeListHead(&ProtectVolumeList[Cur].ListHead);
+			//初始化请求处理队列的锁
+			KeInitializeSpinLock(&ProtectVolumeList[Cur].ListLock);
+			//初始化请求处理队列的同步事件
+			KeInitializeEvent(
+				&ProtectVolumeList[Cur].RequestEvent,
+				SynchronizationEvent,
+				FALSE
+			);
+			//初始化终止处理线程标志
+			ProtectVolumeList[Cur].ThreadTerminate = FALSE;
+			//初始化保存数据相关变量
+			KeInitializeEvent(&ProtectVolumeList[Cur].FinishSaveDataEvent, SynchronizationEvent, FALSE);
+			ProtectVolumeList[Cur].CanSaveData = FALSE;
+			ProtectVolumeList[Cur].ShutdownSaveData = FALSE;
+			ProtectVolumeList[Cur].SavingData = FALSE;
+			//建立用来处理这个卷的请求的处理线程，线程函数的参数则是指向卷信息的指针
+			HANDLE ThreadHandle = NULL;
+			NTSTATUS status = PsCreateSystemThread(
+				&ThreadHandle,
+				(ACCESS_MASK)0L,
+				NULL,
+				NULL,
+				&ProtectVolumeList[Cur].ReadWriteThreadId,
+				ThreadReadWrite,
+				&ProtectVolumeList[Cur]
+			);
+			if (NT_SUCCESS(status))
 			{
-				LogInfo("Successfully get volume logic bitmap\n");
-				// 只有在成功获取位图之后，才认为这个卷有效
-
-				//初始化这个卷的请求处理队列
-				InitializeListHead(&ProtectVolumeList[Cur].ListHead);
-				//初始化请求处理队列的锁
-				KeInitializeSpinLock(&ProtectVolumeList[Cur].ListLock);
-				//初始化请求处理队列的同步事件
-				KeInitializeEvent(
-					&ProtectVolumeList[Cur].RequestEvent,
-					SynchronizationEvent,
-					FALSE
-				);
-				//初始化终止处理线程标志
-				ProtectVolumeList[Cur].ThreadTerminate = FALSE;
-				//建立用来处理这个卷的请求的处理线程，线程函数的参数则是指向卷信息的指针
-				HANDLE ThreadHandle = NULL;
-				NTSTATUS status = PsCreateSystemThread(
-					&ThreadHandle,
-					(ACCESS_MASK)0L,
-					NULL,
-					NULL,
-					&ProtectVolumeList[Cur].ReadWriteThreadId,
-					ThreadReadWrite,
-					&ProtectVolumeList[Cur]
-				);
-				if (NT_SUCCESS(status))
+				if (NT_SUCCESS(InitVolumeLogicBitmap(&ProtectVolumeList[Cur])))
 				{
-					//获取处理线程的对象
-					status = ObReferenceObjectByHandle(
-						ThreadHandle,
-						THREAD_ALL_ACCESS,
-						NULL,
-						KernelMode,
-						&ProtectVolumeList[Cur].ReadWriteThread,
-						NULL
-					);
-
-					if (NULL != ThreadHandle)
-						ZwClose(ThreadHandle);
-
-					if (NT_SUCCESS(status))
-					{
-						ProtectVolumeList[Cur].CanSaveData = TRUE;
-						VaildVolumeCount = Cur + 1;
-						swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
-						LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_OK, strMsg, wcslen(strMsg));
-					}
-					else
-					{
-						ProtectVolumeList[Cur].ThreadTerminate = TRUE;
-						KeSetEvent(
-							&ProtectVolumeList[Cur].RequestEvent,
-							(KPRIORITY)0,
-							FALSE
-						);
-						LogErr("Failed to get thread handle\n");
-						swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
-						LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
-					}
+					LogInfo("Successfully get volume logic bitmap\n");
+					// 只有在成功获取位图之后，才认为这个卷有效
+					ProtectVolumeList[Cur].CanSaveData = TRUE;
+					InterlockedExchange8((PCHAR)&ProtectVolumeList[Cur].Protect, TRUE);
+					InterlockedIncrement((PLONG)&ValidVolumeCount);
+					swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
+					LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_OK, strMsg, wcslen(strMsg));
 				}
 				else
 				{
-					LogInfo("Failed to create handler thread\n");
+					ProtectVolumeList[Cur].ThreadTerminate = TRUE;
+					KeSetEvent(
+						&ProtectVolumeList[Cur].RequestEvent,
+						(KPRIORITY)0,
+						FALSE
+					);
+					// 等待线程结束以防止初始化下一个卷时覆盖数据导致蓝屏
+					KeWaitForSingleObject(
+						&ProtectVolumeList[Cur].FinishSaveDataEvent,
+						Executive,
+						KernelMode,
+						FALSE,
+						NULL
+					);
+					LogInfo("Failed to get volume logic bitmap\n");
 					swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
 					LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
 				}
+
+				if (NULL != ThreadHandle)
+					ZwClose(ThreadHandle);
 			}
 			else
 			{
-				LogInfo("Failed to get volume logic bitmap\n");
+				LogInfo("Failed to create handler thread\n");
 				swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
 				LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
 			}
 		}
 	}
-	LogInfo("VaildVolumeCount = %u\n", VaildVolumeCount);
+	LogInfo("ValidVolumeCount = %u\n", ValidVolumeCount);
 
 	InitVolumeLetter();
 }
@@ -1937,6 +1934,13 @@ void SaveVolumeData(PVOLUME_INFO volumeInfo)
 		}
 	}
 	DPBitmap_Free(BitmapDepends);
+	volumeInfo->Protect = FALSE;
+	DPBitmap_Free(volumeInfo->BitmapUsed);
+	DPBitmap_Free(volumeInfo->BitmapRedirect);
+	DPBitmap_Free(volumeInfo->BitmapRedirectUsed);
+	DPBitmap_Free(volumeInfo->BitmapAllow);
+	RedirectTable_Free(&volumeInfo->RedirectMap);
+	RedirectTable_Free(&volumeInfo->ReverseRedirectMap);
 	swprintf_s(Buf, 256, L"\rFinished saving data on volume %ls         \n", VolName);
 	DisplayString(Buf);
 }
@@ -1981,6 +1985,7 @@ void ThreadReadWrite(PVOID Context)
 		//如果有了线程结束标志，那么就在线程内部自己结束自己
 		if (volume_info->ThreadTerminate)
 		{
+			KeSetEvent(&volume_info->FinishSaveDataEvent, (KPRIORITY)0, FALSE);
 			PsTerminateSystemThread(STATUS_SUCCESS);
 			return;
 		}
@@ -2063,7 +2068,12 @@ void ThreadReadWrite(PVOID Context)
 
 			if (newbuff)
 			{
-				if (IRP_MJ_READ == io_stack->MajorFunction)
+				// 停止保护状态
+				if (!volume_info->Protect)
+				{
+					status = FastFsdRequest(LowerDeviceObject[volume_info->DiskNumber], io_stack->MajorFunction, offset.QuadPart, newbuff, length, TRUE);
+				}
+				else if (IRP_MJ_READ == io_stack->MajorFunction)
 				{
 					if (IsDirectDiskDevice(io_stack->DeviceObject))
 					{
@@ -2129,6 +2139,12 @@ void ThreadReadWrite(PVOID Context)
 			}
 			continue;
 		}
+		// 停止保护标志
+		if (!volume_info->Protect)
+		{
+			PsTerminateSystemThread(STATUS_SUCCESS);
+			return;
+		}
 	}
 }
 
@@ -2174,10 +2190,10 @@ OnDiskFilterReadWrite(
 		return FALSE;
 	}
 
-	for (UINT i = 0; i < VaildVolumeCount; i++)
+	for (UINT i = 0; i < ValidVolumeCount; i++)
 	{
 		// 卷是否在受保护的硬盘上
-		if (ProtectVolumeList[i].DiskNumber != DeviceNumber)
+		if (ProtectVolumeList[i].DiskNumber != DeviceNumber || !ProtectVolumeList[i].Protect)
 			continue;
 
 		if ((offset.QuadPart >= ProtectVolumeList[i].StartOffset) &&
@@ -2367,14 +2383,14 @@ OnDiskFilterDispatchControl(
 					UCHAR Password[32];
 					RtlZeroMemory(Password, 32);
 					SHA256(Data->Password, wcslen(Data->Password) * sizeof(WCHAR), Password);
-					BOOLEAN NewConfigVaild = IsVaildConfig(&NewConfig);
-					BOOLEAN CurConfigVaild = IsVaildConfig(&Config);
-					if (!NewConfigVaild && !CurConfigVaild)
+					BOOLEAN NewConfigValid = IsValidConfig(&NewConfig);
+					BOOLEAN CurConfigValid = IsValidConfig(&Config);
+					if (!NewConfigValid && !CurConfigValid)
 					{
 						*Status = STATUS_UNSUCCESSFUL;
 						break;
 					}
-					if ((NewConfigVaild && !RtlEqualMemory(Password, NewConfig.Password, 32)) || (!NewConfigVaild && CurConfigVaild && !RtlEqualMemory(Password, Config.Password, 32)))
+					if ((NewConfigValid && !RtlEqualMemory(Password, NewConfig.Password, 32)) || (!NewConfigValid && CurConfigValid && !RtlEqualMemory(Password, Config.Password, 32)))
 					{
 						*Status = STATUS_ACCESS_DENIED;
 						if (IsProtect)
@@ -2398,7 +2414,7 @@ OnDiskFilterDispatchControl(
 					case DISKFILTER_CONTROL_SETCONFIG:
 					{
 						RtlCopyMemory(&NewConfig, &Data->Config, sizeof(NewConfig));
-						if (IsVaildConfig(&NewConfig))
+						if (IsValidConfig(&NewConfig))
 						{
 							UCHAR Mask = PROTECTION_ALLOW_DRIVER_LOAD | PROTECTION_DRIVER_WHITELIST | PROTECTION_DRIVER_BLACKLIST;
 							UCHAR NewFlags = (Config.ProtectionFlags & ~Mask) | (NewConfig.ProtectionFlags & Mask);
@@ -2419,8 +2435,8 @@ OnDiskFilterDispatchControl(
 							CurStatus.AllowDriverLoad = AllowLoadDriver;
 							CurStatus.ProtectEnabled = IsProtect;
 							CurStatus.DirectMountEnabled = AllowDirectMount;
-							CurStatus.ProtectVolumeCount = VaildVolumeCount;
-							for (UCHAR i = 0; i < VaildVolumeCount; i++)
+							CurStatus.ProtectVolumeCount = ValidVolumeCount;
+							for (UCHAR i = 0; i < ValidVolumeCount; i++)
 							{
 								CurStatus.ProtectVolume[i] = DISKFILTER_MAKE_VOLNUM(ProtectVolumeList[i].DiskNumber, ProtectVolumeList[i].PartitionNumber);
 							}
@@ -2576,7 +2592,7 @@ OnDiskFilterDispatchControl(
 							PDEVICE_OBJECT DeviceObject;
 							ULONG TotalCount = 0;
 							DeviceObject = FilterDevice->DriverObject->DeviceObject;
-							for (UINT i = 0; i < VaildVolumeCount; i++)
+							for (UINT i = 0; i < ValidVolumeCount; i++)
 							{
 								if (ProtectVolumeList[i].ShutdownSaveData && ProtectVolumeList[i].CanSaveData)
 								{
@@ -2625,18 +2641,18 @@ OnDiskFilterDispatchShutdown(
 	if (StackLocation->MajorFunction == IRP_MJ_SHUTDOWN)
 	{
 		BOOLEAN NeedSaveData = FALSE;
-		for (UINT i = 0; i < VaildVolumeCount; i++)
+		for (UINT i = 0; i < ValidVolumeCount; i++)
 		{
 			if (ProtectVolumeList[i].ShutdownSaveData)
 			{
 				if (!NeedSaveData)
 				{
+					LogInfo("Enter data saving process...\n");
 					if (!DisableShutdownMessage)
 						InitDisplay();
 					DisplayString(L"DiskFilter is saving data...\nPlease do not shut down or restart the computer.\n");
 					NeedSaveData = TRUE;
 				}
-				KeInitializeEvent(&ProtectVolumeList[i].FinishSaveDataEvent, SynchronizationEvent, FALSE);
 				InterlockedExchange8((PCHAR)&ProtectVolumeList[i].SavingData, TRUE);
 				KeSetEvent(
 					&ProtectVolumeList[i].RequestEvent,
@@ -2779,9 +2795,9 @@ void DriverReinit(PDRIVER_OBJECT DriverObject, PVOID Context, ULONG Count)
 
 	if (Config.ProtectionFlags & PROTECTION_ENABLE)
 	{
-		InitProtectVolumes();
 		InitProtectDisks();
 		StartProtect();
+		InitProtectVolumes();
 		IoRegisterLastChanceShutdownNotification(FilterDevice);
 
 		LogErrorMessage(FilterDevice, MSG_PROTECTION_ENABLED);
@@ -2880,7 +2896,7 @@ OnDiskFilterInitialization(
 	mempool_init();
 
 	FilterDevice = NULL;
-	VaildVolumeCount = 0;
+	ValidVolumeCount = 0;
 	ConfigFileObject = NULL;
 	memset(LowerDeviceObject, 0, sizeof(LowerDeviceObject));
 	memset(&Config, 0, sizeof(Config));
@@ -2888,7 +2904,7 @@ OnDiskFilterInitialization(
 	ExInitializeResourceLite(&DriverListLock);
 	memset(ProtectVolumeList, 0, sizeof(ProtectVolumeList));
 	memset(VolumeList, 0, sizeof(VolumeList));
-	VaildVolumeCount = 0;
+	ValidVolumeCount = 0;
 	memset(ProtectDiskList, 0, sizeof(ProtectDiskList));
 	memset(&ConfigVolume, 0, sizeof(ConfigVolume));
 	ConfigVcnPairs = NULL;

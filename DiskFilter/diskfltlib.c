@@ -484,6 +484,10 @@ Return Value:
 	PDEVICE_EXTENSION   deviceExtension;
 
 	PAGED_CODE();
+
+	if (PreCheckRemovedDirectDisk(DeviceObject, Irp, STATUS_INVALID_DEVICE_REQUEST))
+		return STATUS_INVALID_DEVICE_REQUEST;
+
 	if (IsThawSpaceDevice(DeviceObject) || IsDirectDiskDevice(DeviceObject))
 	{
 		Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
@@ -817,8 +821,8 @@ Return Value:
 	// add by tanwen 
 	if (DeviceObject == g_cdo && OnDiskFilterDispatchControl(DeviceObject, Irp, &mystatus))
 		return mystatus;
-	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
-		return STATUS_SUCCESS;
+	if (PreCheckRemovedDirectDisk(DeviceObject, Irp, STATUS_INVALID_DEVICE_REQUEST))
+		return STATUS_INVALID_DEVICE_REQUEST;
 	if (IsThawSpaceDevice(DeviceObject) || IsDirectDiskDevice(DeviceObject))
 	{
 		Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
@@ -841,6 +845,8 @@ DiskPerfDispatchPower(
 )
 {
 	PDEVICE_EXTENSION deviceExtension;
+	if (PreCheckRemovedDirectDisk(DeviceObject, Irp, STATUS_INVALID_DEVICE_REQUEST))
+		return STATUS_INVALID_DEVICE_REQUEST;
 	if (IsThawSpaceDevice(DeviceObject) || IsDirectDiskDevice(DeviceObject))
 	{
 		Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
@@ -955,7 +961,7 @@ Return Value:
 	if (DeviceObject == g_cdo && OnDiskFilterDispatchControl(DeviceObject, Irp, &mystatus))
 		return mystatus;
 
-	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
+	if (PreCheckRemovedDirectDisk(DeviceObject, Irp, STATUS_SUCCESS))
 		return STATUS_SUCCESS;
 
 	if (IsThawSpaceDevice(DeviceObject))
@@ -987,7 +993,7 @@ DiskPerfClose(
 	if (DeviceObject == g_cdo && OnDiskFilterDispatchControl(DeviceObject, Irp, &mystatus))
 		return mystatus;
 
-	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
+	if (PreCheckRemovedDirectDisk(DeviceObject, Irp, STATUS_SUCCESS))
 		return STATUS_SUCCESS;
 
 	if (IsThawSpaceDevice(DeviceObject))
@@ -1048,8 +1054,8 @@ Return Value:
 	if (DeviceObject == g_cdo && OnDiskFilterDispatchControl(DeviceObject, Irp, &mystatus))
 		return mystatus;
 
-	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
-		return STATUS_SUCCESS;
+	if (PreCheckRemovedDirectDisk(DeviceObject, Irp, STATUS_NO_MEDIA_IN_DEVICE))
+		return STATUS_NO_MEDIA_IN_DEVICE;
 
 	if (IsThawSpaceDevice(DeviceObject))
 		return ThawSpaceReadWrite(DeviceObject, Irp);
@@ -1111,8 +1117,8 @@ Return Value:
 	if (DeviceObject == g_cdo && OnDiskFilterDispatchControl(DeviceObject, Irp, &mystatus))
 		return mystatus;
 
-	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
-		return STATUS_SUCCESS;
+	if (PreCheckRemovedDirectDisk(DeviceObject, Irp, STATUS_NO_MEDIA_IN_DEVICE))
+		return STATUS_NO_MEDIA_IN_DEVICE;
 
 	if (IsThawSpaceDevice(DeviceObject))
 		return ThawSpaceDeviceControl(DeviceObject, Irp);
@@ -1173,7 +1179,7 @@ Return Value:
 	PDEVICE_EXTENSION  deviceExtension = DeviceObject->DeviceExtension;
 	NTSTATUS mystatus;
 
-	if (NT_SUCCESS(PreCheckRemovedDirectDisk(DeviceObject, Irp)))
+	if (PreCheckRemovedDirectDisk(DeviceObject, Irp, STATUS_SUCCESS))
 		return STATUS_SUCCESS;
 
 	if (IsThawSpaceDevice(DeviceObject) || IsDirectDiskDevice(DeviceObject))

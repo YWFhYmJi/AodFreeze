@@ -9,9 +9,9 @@
 #include "IrpFile.h"
 #include <mountmgr.h>
 
-NTSTATUS KSleep(ULONG microSecond)
+NTSTATUS KSleep(ULONG milliSeconds)
 {
-	LARGE_INTEGER timeout = RtlConvertLongToLargeInteger(-10000 * microSecond);
+	LARGE_INTEGER timeout = RtlConvertLongToLargeInteger(-10000 * milliSeconds);
 	KeDelayExecutionThread(KernelMode, FALSE, &timeout);
 	return STATUS_SUCCESS;
 }

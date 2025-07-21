@@ -57,10 +57,11 @@ IsDirectDiskDevice(
 	IN PDEVICE_OBJECT DeviceObject
 );
 
-NTSTATUS
+BOOLEAN
 PreCheckRemovedDirectDisk(
 	IN PDEVICE_OBJECT   DeviceObject,
-	IN PIRP             Irp
+	IN PIRP             Irp,
+	IN NTSTATUS			ReturnStatus
 );
 
 PDEVICE_OBJECT
