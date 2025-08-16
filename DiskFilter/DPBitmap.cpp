@@ -93,7 +93,7 @@ ULONGLONG DPBitmap_FindNext(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 	ULONG	slot = 0;
 
 	// 遍历slot
-	for (slot = min(startIndex / bitMap->regionSize, bitMap->regionNumber - 1); slot < bitMap->regionNumber; slot++)
+	for (slot = (ULONG)min(startIndex / bitMap->regionSize, bitMap->regionNumber - 1); slot < bitMap->regionNumber; slot++)
 	{
 		ULONGLONG	max = 0;
 
@@ -143,7 +143,7 @@ ULONGLONG DPBitmap_FindPrev(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 	ULONG	slot = 0;
 
 	// 遍历slot
-	for (slot = min(startIndex / bitMap->regionSize, bitMap->regionNumber - 1); ; slot--)
+	for (slot = (ULONG)min(startIndex / bitMap->regionSize, bitMap->regionNumber - 1); ; slot--)
 	{
 		ULONGLONG	mn = 0;
 

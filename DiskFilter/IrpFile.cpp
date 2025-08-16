@@ -8,6 +8,8 @@ NTSTATUS MyCompleteRoutine(
 	IN PIRP pIrp,
 	IN PVOID Context)
 {
+	UNREFERENCED_PARAMETER(DeviceObject);
+	UNREFERENCED_PARAMETER(Context);
 	*pIrp->UserIosb = pIrp->IoStatus;
 
 	// 设置事件信号
@@ -95,8 +97,8 @@ NTSTATUS IrpCreateFile(
 	IN PVOID EaBuffer OPTIONAL,
 	IN ULONG EaLength)
 {
+	UNREFERENCED_PARAMETER(AllocationSize);
 	NTSTATUS status = STATUS_SUCCESS;
-	UNICODE_STRING ustrRootPath;
 	OBJECT_ATTRIBUTES objectAttributes = { 0 };
 	PFILE_OBJECT pRootFileObject = NULL, pFileObject = NULL;
 	PDEVICE_OBJECT RootDeviceObject = NULL, RootRealDevice = NULL;

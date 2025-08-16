@@ -329,8 +329,8 @@ Return Value:
 
 VOID
 DiskPerfSyncFilterWithTarget(
-	IN PDEVICE_OBJECT FilterDevice,
-	IN PDEVICE_OBJECT TargetDevice
+	IN PDEVICE_OBJECT FilterDeviceObject,
+	IN PDEVICE_OBJECT TargetDeviceObject
 )
 {
 	ULONG                   propFlags;
@@ -342,11 +342,11 @@ DiskPerfSyncFilterWithTarget(
 	// at the diskperf object capabilities to figure out if the disk is
 	// a removable and perhaps other things.
 	//
-	propFlags = TargetDevice->Flags & FILTER_DEVICE_PROPOGATE_FLAGS;
-	FilterDevice->Flags |= propFlags;
+	propFlags = TargetDeviceObject->Flags & FILTER_DEVICE_PROPOGATE_FLAGS;
+	FilterDeviceObject->Flags |= propFlags;
 
-	propFlags = TargetDevice->Characteristics & FILTER_DEVICE_PROPOGATE_CHARACTERISTICS;
-	FilterDevice->Characteristics |= propFlags;
+	propFlags = TargetDeviceObject->Characteristics & FILTER_DEVICE_PROPOGATE_CHARACTERISTICS;
+	FilterDeviceObject->Characteristics |= propFlags;
 
 
 }
@@ -587,7 +587,7 @@ Return Value:
 		if (NT_SUCCESS(status)) {
 
 			IoAdjustPagingPathCount(
-				&deviceExtension->PagingPathCount,
+				(PLONG)&deviceExtension->PagingPathCount,
 				irpStack->Parameters.UsageNotification.InPath);
 
 			if (irpStack->Parameters.UsageNotification.InPath) {
@@ -1042,12 +1042,6 @@ Return Value:
 
 {
 	PDEVICE_EXTENSION  deviceExtension = DeviceObject->DeviceExtension;
-	PIO_STACK_LOCATION currentIrpStack = IoGetCurrentIrpStackLocation(Irp);
-	PIO_STACK_LOCATION nextIrpStack = IoGetNextIrpStackLocation(Irp);
-	ULONG              processor = (ULONG)KeGetCurrentProcessorNumber();
-	PDISK_PERFORMANCE  partitionCounters = NULL;
-	LONG               queueLen;
-	PLARGE_INTEGER     timeStamp;
 	NTSTATUS mystatus;
 
 	// add by tanwen 
@@ -1106,7 +1100,6 @@ Return Value:
 
 {
 	PDEVICE_EXTENSION  deviceExtension = DeviceObject->DeviceExtension;
-	PIO_STACK_LOCATION currentIrpStack = IoGetCurrentIrpStackLocation(Irp);
 
 	// add by tanwen
 	NTSTATUS mystatus;
@@ -1271,7 +1264,6 @@ Return Value:
 	PDEVICE_EXTENSION       deviceExtension;
 	PIRP                    irp;
 	STORAGE_DEVICE_NUMBER   number;
-	ULONG                   registrationFlag = 0;
 
 	PAGED_CODE();
 
@@ -1525,7 +1517,7 @@ Return Value:
 	errorLogEntry = (PIO_ERROR_LOG_PACKET)
 		IoAllocateErrorLogEntry(
 			DeviceObject,
-			(UCHAR)(sizeof(IO_ERROR_LOG_PACKET) + sizeof(DEVICE_OBJECT))
+			sizeof(IO_ERROR_LOG_PACKET)//(UCHAR)(sizeof(IO_ERROR_LOG_PACKET) + sizeof(DEVICE_OBJECT))
 		);
 
 	if (errorLogEntry != NULL) {
@@ -1536,11 +1528,12 @@ Return Value:
 		// The following is necessary because DumpData is of type ULONG
 		// and DeviceObject can be more than that
 		//
-		RtlCopyMemory(
+		/*RtlCopyMemory(
 			&errorLogEntry->DumpData[0],
 			&DeviceObject,
 			sizeof(DEVICE_OBJECT));
-		errorLogEntry->DumpDataSize = sizeof(DEVICE_OBJECT);
+		errorLogEntry->DumpDataSize = sizeof(DEVICE_OBJECT);*/
+		errorLogEntry->DumpDataSize = 0;
 		IoWriteErrorLogEntry(errorLogEntry);
 	}
 }

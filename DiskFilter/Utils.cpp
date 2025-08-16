@@ -54,7 +54,7 @@ NTSTATUS WriteReadOnlyMemory(
 #define rightrotate(w, n) ((w >> n) | (w) << (32-(n)))
 #define copy_uint32(p, val) *((UINT32 *)p) = swap_endian<UINT32>((val))
 
-void SHA256(const PVOID lpData, ULONG64 ulSize, UCHAR lpOutput[32])
+void SHA256(const PVOID lpData, SIZE_T ulSize, UCHAR lpOutput[32])
 {
 	static const UINT32 k[64] = {
 		0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -77,12 +77,12 @@ void SHA256(const PVOID lpData, ULONG64 ulSize, UCHAR lpOutput[32])
 	UINT32 h7 = 0x5be0cd19;
 	int r = (int)(ulSize * 8 % 512);
 	int append = ((r < 448) ? (448 - r) : (448 + 512 - r)) / 8;
-	ULONG64 new_len = ulSize + append + 8;
+	SIZE_T new_len = ulSize + append + 8;
 	PUCHAR buf = (PUCHAR)__malloc(new_len);
 	RtlZeroMemory(buf + ulSize, append);
 	RtlCopyMemory(buf, lpData, ulSize);
 	buf[ulSize] = 0x80;
-	UINT64 bits_len = ulSize * 8;
+	UINT64 bits_len = ulSize * 8ull;
 	for (int i = 0; i < 8; i++)
 	{
 		buf[ulSize + append + i] = (bits_len >> ((7 - i) * 8)) & 0xff;
@@ -90,7 +90,7 @@ void SHA256(const PVOID lpData, ULONG64 ulSize, UCHAR lpOutput[32])
 	UINT32 w[64];
 	RtlZeroMemory(w, sizeof(w));
 	size_t chunk_len = new_len / 64;
-	for (int idx = 0; idx < chunk_len; idx++)
+	for (size_t idx = 0; idx < chunk_len; idx++)
 	{
 		UINT32 val = 0;
 		for (int i = 0; i < 64; i++)
@@ -437,7 +437,7 @@ NTSTATUS GetImageHash(PUNICODE_STRING lpFileName, UCHAR lpHash[32])
 		status = ZwReadFile(FileHandle, NULL, NULL, NULL, &StatusBlock, Buffer + 8, (ULONG)lSize, NULL, NULL);
 		if (NT_SUCCESS(status))
 		{
-			SHA256(Buffer, lSize + 8, lpHash);
+			SHA256(Buffer, (SIZE_T)lSize + 8, lpHash);
 		}
 	}
 	else
@@ -445,7 +445,7 @@ NTSTATUS GetImageHash(PUNICODE_STRING lpFileName, UCHAR lpHash[32])
 		LONGLONG lCur = 0;
 		while (lCur < lSize)
 		{
-			ULONG lRead = min(lSize - lCur, HASH_BUFFER_SIZE);
+			ULONG lRead = (ULONG)min(lSize - lCur, HASH_BUFFER_SIZE);
 			status = ZwReadFile(FileHandle, NULL, NULL, NULL, &StatusBlock, Buffer + 40, lRead, NULL, NULL);
 			if (!NT_SUCCESS(status))
 				goto out;
@@ -545,7 +545,7 @@ NTSTATUS GetFatFirstSectorOffset(HANDLE fileHandle, PULONGLONG firstDataSector)
 		// 得到数据区开始，就是第一簇的位置
 		*firstDataSector =
 			(fatLBR.bpb.wRsvdSecCnt +
-			(fatLBR.bpb.byNumFATs * dwFATSz) +
+			(fatLBR.bpb.byNumFATs * (ULONGLONG)dwFATSz) +
 				dwRootDirSectors);
 	}
 
@@ -838,11 +838,12 @@ NTSTATUS FastFsdRequest(
 	IN LONGLONG ByteOffset,
 	OUT PVOID Buffer,
 	IN ULONG Length,
-	IN BOOLEAN Wait
+	IN BOOLEAN Wait,
+	IN BOOLEAN ForceWrite
 )
 {
 	PIRP irp;
-	IO_STATUS_BLOCK iosb;
+	IO_STATUS_BLOCK iosb = { 0 };
 	KEVENT event;
 	NTSTATUS status;
 	LARGE_INTEGER byteOffset;
@@ -863,7 +864,7 @@ NTSTATUS FastFsdRequest(
 	The SL_FORCE_DIRECT_WRITE flag is available in Windows Vista and later versions of Windows.
 	http://msdn.microsoft.com/en-us/library/ms795960.aspx
 	*/
-	if (IRP_MJ_WRITE == MajorFunction)
+	if (IRP_MJ_WRITE == MajorFunction && ForceWrite)
 	{
 		IoGetNextIrpStackLocation(irp)->Flags |= SL_FORCE_DIRECT_WRITE;
 	}
@@ -1220,7 +1221,7 @@ NTSTATUS MountVolume(PUNICODE_STRING DeviceName, WCHAR VolumeLetter)
 	UNICODE_STRING SymLink;
 	NTSTATUS status;
 
-	VolumeLetter = toupper(VolumeLetter);
+	VolumeLetter = towupper(VolumeLetter);
 	swprintf_s(SymLinkName, MAX_PATH, L"\\DosDevices\\Global\\%c:", VolumeLetter);
 	RtlInitUnicodeString(&SymLink, SymLinkName);
 	status = IoCreateSymbolicLink(&SymLink, DeviceName);
@@ -1238,7 +1239,7 @@ NTSTATUS UnmountVolume(WCHAR VolumeLetter)
 	UNICODE_STRING SymLink;
 	NTSTATUS status;
 
-	VolumeLetter = toupper(VolumeLetter);
+	VolumeLetter = towupper(VolumeLetter);
 	swprintf_s(SymLinkName, MAX_PATH, L"\\DosDevices\\Global\\%c:", VolumeLetter);
 	RtlInitUnicodeString(&SymLink, SymLinkName);
 	status = IoDeleteSymbolicLink(&SymLink);
@@ -1268,7 +1269,7 @@ void DisplayString(PWCHAR String)
 {
 	UNICODE_STRING str = { 0 };
 	str.Buffer = String;
-	str.Length = str.MaximumLength = wcslen(String) * sizeof(WCHAR);
+	str.Length = str.MaximumLength = (USHORT)(wcslen(String) * sizeof(WCHAR));
 	ZwDisplayString(&str);
 }
 
@@ -1337,7 +1338,7 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	bpb.Media = 0xf8;
 	bpb.SectorsPerTrack = 32;          // unknown here
 	bpb.NumberOfHeads = 2;             // ?
-	bpb.TotalSectors32 = FileSize / 0x200;
+	bpb.TotalSectors32 = (ULONG)(FileSize / 0x200);
 	// BPB-FAT32 Extension
 	UINT TmpVal2 = ((256 * bpb.SectorsPerCluster) + bpb.NumFATs) / 2;
 	bpb.fat32.FATSize = (bpb.TotalSectors32 - bpb.ReservedSectorCount + (TmpVal2 - 1)) / TmpVal2;
@@ -1389,7 +1390,7 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	*((UINT*)(sectorBuf + 0x008)) = 0x0fffffff;   // root directory (one cluster)
 	Offset.QuadPart = bpb.ReservedSectorCount * 512ull;
 	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
-	Offset.QuadPart = (bpb.ReservedSectorCount + bpb.fat32.FATSize) * 512ull;
+	Offset.QuadPart = (bpb.ReservedSectorCount + (ULONGLONG)bpb.fat32.FATSize) * 512ull;
 	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
 	LogInfo("Write root directory ok\n");
 

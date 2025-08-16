@@ -7,7 +7,7 @@ EXTERN_C_START
 typedef struct _OPEN_FILE_INFORMATION {
 	LARGE_INTEGER       FileSize;
 	BOOLEAN             ReadOnly;
-	UCHAR               DriveLetter;
+	WCHAR               DriveLetter;
 	USHORT              FileNameLength;
 	WCHAR               FileName[1];
 } OPEN_FILE_INFORMATION, *POPEN_FILE_INFORMATION;

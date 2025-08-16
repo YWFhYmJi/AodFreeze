@@ -48,26 +48,26 @@ UINT DirectDiskCount; // 已挂载的直接读写卷数量
 void ThreadReadWrite(PVOID Context);
 
 // 检查配置文件是否有效
-BOOLEAN IsValidConfig(PDISKFILTER_PROTECTION_CONFIG Config)
+BOOLEAN IsValidConfig(PDISKFILTER_PROTECTION_CONFIG Conf)
 {
 	// 头部不匹配
-	if (Config->Magic != DISKFILTER_CONFIG_MAGIC)
+	if (Conf->Magic != DISKFILTER_CONFIG_MAGIC)
 		return FALSE;
 
 	// 版本不匹配
-	if (Config->Version != DISKFILTER_DRIVER_VERSION)
+	if (Conf->Version != DISKFILTER_DRIVER_VERSION)
 		return FALSE;
 
 	// 保护卷个数无效
-	if (Config->ProtectVolumeCount > sizeof(Config->ProtectVolume) / sizeof(Config->ProtectVolume[0]))
+	if (Conf->ProtectVolumeCount > sizeof(Conf->ProtectVolume) / sizeof(Conf->ProtectVolume[0]))
 		return FALSE;
 
 	// 驱动白名单或黑名单个数无效
-	if (Config->DriverCount > sizeof(Config->DriverList) / sizeof(Config->DriverList[0]))
+	if (Conf->DriverCount > sizeof(Conf->DriverList) / sizeof(Conf->DriverList[0]))
 		return FALSE;
 
 	// 解冻空间个数无效
-	if (Config->ThawSpaceCount > sizeof(Config->ThawSpacePath) / sizeof(Config->ThawSpacePath[0]))
+	if (Conf->ThawSpaceCount > sizeof(Conf->ThawSpacePath) / sizeof(Conf->ThawSpacePath[0]))
 		return FALSE;
 
 	return TRUE;
@@ -198,7 +198,7 @@ NTSTATUS GetVolumeInfo(ULONG DiskNum, DWORD PartitionNum, PVOLUME_INFO info)
 }
 
 // 读取保护配置
-NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION_CONFIG RetConfig)
+NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigFilePath, PDISKFILTER_PROTECTION_CONFIG RetConfig)
 {
 	NTSTATUS status;
 	PDISKFILTER_PROTECTION_CONFIG Conf = NULL;
@@ -206,7 +206,7 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 	HANDLE ConfigHandle;
 	PFILE_OBJECT ConfigFile;
 
-	LogInfo("Reading config file (%wZ)\n", ConfigPath);
+	LogInfo("Reading config file (%wZ)\n", ConfigFilePath);
 
 	if (!RetConfig)
 		return STATUS_UNSUCCESSFUL;
@@ -216,10 +216,10 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 		return STATUS_INSUFFICIENT_RESOURCES;
 
 	WCHAR prefix[] = L"\\??\\";
-	PWCHAR TempPath = (PWCHAR)__malloc(ConfigPath->Length + (wcslen(prefix) + 10) * sizeof(WCHAR));
+	PWCHAR TempPath = (PWCHAR)__malloc(ConfigFilePath->Length + (wcslen(prefix) + 10) * sizeof(WCHAR));
 	if (TempPath)
 	{
-		swprintf(TempPath, L"%ls%wZ", prefix, ConfigPath);
+		swprintf(TempPath, L"%ls%wZ", prefix, ConfigFilePath);
 		UNICODE_STRING uniPath;
 		RtlInitUnicodeString(&uniPath, TempPath);
 		if (NT_SUCCESS(GetFileHandleReadOnly(&ConfigHandle, &uniPath)))
@@ -228,9 +228,9 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 			{
 				UNICODE_STRING	uniDosName;
 				// 得到类似C:这样的盘符，为了获取VolumeInfo
-				if (NT_SUCCESS(IoVolumeDeviceToDosName(ConfigFile->DeviceObject, &uniDosName)))
+				if (NT_SUCCESS(IoVolumeDeviceToDosName(ConfigFile->DeviceObject, &uniDosName)) && uniDosName.Buffer)
 				{
-					WCHAR ConfigVolumeLetter = toupper(*(WCHAR *)uniDosName.Buffer);
+					WCHAR ConfigVolumeLetter = towupper(*(WCHAR *)uniDosName.Buffer);
 					ULONG ConfigDiskNum, ConfigPartNum;
 					if (NT_SUCCESS(GetPartNumFromVolLetter(ConfigVolumeLetter, &ConfigDiskNum, &ConfigPartNum)))
 					{
@@ -261,7 +261,7 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 	}
 
 	// 打开配置文件，发送IRP独占配置文件，避免配置文件被其他程序修改或删除
-	status = IrpCreateFile(&ConfigFileObject, FILE_ALL_ACCESS, ConfigPath, &IoStatus, NULL, FILE_ATTRIBUTE_NORMAL, 0, FILE_OPEN, FILE_NO_INTERMEDIATE_BUFFERING, NULL, 0);
+	status = IrpCreateFile(&ConfigFileObject, FILE_ALL_ACCESS, ConfigFilePath, &IoStatus, NULL, FILE_ATTRIBUTE_NORMAL, 0, FILE_OPEN, FILE_NO_INTERMEDIATE_BUFFERING, NULL, 0);
 	if (!NT_SUCCESS(status))
 		return status;
 
@@ -271,10 +271,11 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigPath, PDISKFILTER_PROTECTION
 
 	// 不需要关闭配置文件对象
 
-	LogInfo("Magic=0x%.4X, Version=0x%.4X, Flags=%.2X\n", Conf->Magic, Conf->Version, Conf->ProtectionFlags);
-
 	if (!IsValidConfig(Conf))
+	{
+		LogErr("Config file is invalid! Magic=0x%.4X, Version=0x%.4X, Flags=%.2X\n", Conf->Magic, Conf->Version, Conf->ProtectionFlags);
 		return STATUS_UNSUCCESSFUL;
+	}
 
 	RtlCopyMemory(RetConfig, Conf, sizeof(DISKFILTER_PROTECTION_CONFIG));
 	return STATUS_SUCCESS;
@@ -386,7 +387,7 @@ NTSTATUS InitVolumeLogicBitmap(PVOLUME_INFO volumeInfo)
 	}
 
 	// 初始化位图
-	for (i = 0; i < Bitmap->BitmapSize.QuadPart; i++)
+	for (i = 0; i < (ULONGLONG)Bitmap->BitmapSize.QuadPart; i++)
 	{
 		if (bitmap_test((PULONG)Bitmap->Buffer, i))
 		{
@@ -524,7 +525,7 @@ void InitVolumeAllowList(PVOLUME_INFO volumeInfo)
 			{
 				if (!NT_SUCCESS(SetDirectReadWriteFile(volumeInfo, Config.ThawSpacePath[i] + 2)))
 				{
-					LogErrorMessageWithString(FilterDevice, MSG_THAWSPACE_LOAD_FAILED, Config.ThawSpacePath[i], wcslen(Config.ThawSpacePath[i]));
+					LogErrorMessageWithString(FilterDevice, MSG_THAWSPACE_LOAD_FAILED, Config.ThawSpacePath[i], (ULONG)wcslen(Config.ThawSpacePath[i]));
 				}
 			}
 		}
@@ -837,7 +838,7 @@ void InitProtectVolumes()
 					InterlockedExchange8((PCHAR)&ProtectVolumeList[Cur].Protect, TRUE);
 					InterlockedIncrement((PLONG)&ValidVolumeCount);
 					swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
-					LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_OK, strMsg, wcslen(strMsg));
+					LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_OK, strMsg, (ULONG)wcslen(strMsg));
 				}
 				else
 				{
@@ -857,7 +858,7 @@ void InitProtectVolumes()
 					);
 					LogInfo("Failed to get volume logic bitmap\n");
 					swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
-					LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
+					LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, (ULONG)wcslen(strMsg));
 				}
 
 				if (NULL != ThreadHandle)
@@ -867,7 +868,7 @@ void InitProtectVolumes()
 			{
 				LogInfo("Failed to create handler thread\n");
 				swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
-				LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, wcslen(strMsg));
+				LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, (ULONG)wcslen(strMsg));
 			}
 		}
 	}
@@ -909,7 +910,7 @@ void InitThawSpace()
 				ofn->DriveLetter = TCfg;
 				RtlCopyMemory(ofn->FileName, prefix, wcslen(prefix) * sizeof(WCHAR));
 				RtlCopyMemory(ofn->FileName + wcslen(prefix), Config.ThawSpacePath[i], MAX_PATH * sizeof(WCHAR));
-				ofn->FileNameLength = wcslen(ofn->FileName);
+				ofn->FileNameLength = (USHORT)wcslen(ofn->FileName);
 				ofn->FileSize.QuadPart = *(ULONGLONG*)&Config.ThawSpacePath[i][MAX_PATH + 1];
 				ofn->ReadOnly = FALSE;
 				if (NT_SUCCESS(ThawSpaceOpenFile(CurDevice, ofn)))
@@ -921,11 +922,11 @@ void InitThawSpace()
 			}
 			if (Success)
 			{
-				LogErrorMessageWithString(FilterDevice, MSG_THAWSPACE_LOAD_OK, Config.ThawSpacePath[i], wcslen(Config.ThawSpacePath[i]));
+				LogErrorMessageWithString(FilterDevice, MSG_THAWSPACE_LOAD_OK, Config.ThawSpacePath[i], (ULONG)wcslen(Config.ThawSpacePath[i]));
 			}
 			else
 			{
-				LogErrorMessageWithString(FilterDevice, MSG_THAWSPACE_LOAD_FAILED, Config.ThawSpacePath[i], wcslen(Config.ThawSpacePath[i]));
+				LogErrorMessageWithString(FilterDevice, MSG_THAWSPACE_LOAD_FAILED, Config.ThawSpacePath[i], (ULONG)wcslen(Config.ThawSpacePath[i]));
 			}
 		}
 		else
@@ -935,7 +936,7 @@ void InitThawSpace()
 			UNICODE_STRING FilePath;
 			RtlInitUnicodeString(&FilePath, Config.ThawSpacePath[i]);
 			IrpCreateFile(&FileObject, FILE_ALL_ACCESS, &FilePath, &IoStatus, NULL, FILE_ATTRIBUTE_NORMAL, 0, FILE_OPEN, FILE_NO_INTERMEDIATE_BUFFERING, NULL, 0);
-			LogErrorMessageWithString(FilterDevice, MSG_THAWSPACE_HIDE, Config.ThawSpacePath[i], wcslen(Config.ThawSpacePath[i]));
+			LogErrorMessageWithString(FilterDevice, MSG_THAWSPACE_HIDE, Config.ThawSpacePath[i], (ULONG)wcslen(Config.ThawSpacePath[i]));
 		}
 	}
 }
@@ -1055,7 +1056,7 @@ void CheckThawSpace()
 								int LastProgress = -1;
 								while (Cur < FileSize)
 								{
-									ULONG WriteSize = min(BufferSize, FileSize - Cur);
+									ULONG WriteSize = (ULONG)min(BufferSize, FileSize - Cur);
 									Offset.QuadPart = Cur;
 									ZwWriteFile(file_handle, NULL, NULL, NULL, &IoStatus, Buffer, WriteSize, &Offset, NULL);
 									Cur += WriteSize;
@@ -1288,7 +1289,7 @@ ULONGLONG GetRealSectorForRead(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, PULO
 }
 
 // 添加重定向记录
-__inline void AddRedirectRecord(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULONGLONG realIndex, ULONG sectorCount)
+__inline void AddRedirectRecord(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULONGLONG realIndex, ULONGLONG sectorCount)
 {
 	RedirectTable_Insert(&volumeInfo->RedirectMap, orgIndex, realIndex, sectorCount, NULL);
 	if (AllowDirectMount)
@@ -1396,7 +1397,7 @@ NTSTATUS HandleDiskRequest(
 	void * buff,
 	ULONG length)
 {
-	NTSTATUS	status;
+	NTSTATUS	status = STATUS_SUCCESS;
 
 	// 当前操作的物理偏移
 	ULONGLONG	physicalOffset = 0;
@@ -1460,7 +1461,7 @@ NTSTATUS HandleDiskRequest(
 			prevIndex = realIndex;
 			prevOffset = physicalOffset;
 			prevBuffer = buff;
-			totalProcessBytes = bytesPerSector * curCount;
+			totalProcessBytes = bytesPerSector * (ULONG)curCount;
 			prevNeedRedirect = needRedirect;
 
 			isFirstBlock = FALSE;
@@ -1472,7 +1473,7 @@ NTSTATUS HandleDiskRequest(
 		if (prevIndex != -1 && realIndex == prevIndex + 1 && needRedirect == prevNeedRedirect)
 		{
 			prevIndex = realIndex + curCount - 1;
-			totalProcessBytes += bytesPerSector * curCount;
+			totalProcessBytes += bytesPerSector * (ULONG)curCount;
 			goto __next;
 		}
 		// 处理上次连续需要处理的簇, 重置isFirstBlock
@@ -1511,7 +1512,7 @@ NTSTATUS HandleDiskRequest(
 		// 跳到下一个扇区, 处理剩余的数据
 		logicOffset += (ULONGLONG)bytesPerSector * curCount;
 		buff = (char *)buff + bytesPerSector * curCount;
-		length -= bytesPerSector * curCount;
+		length -= bytesPerSector * (ULONG)curCount;
 	}
 
 	return status;
@@ -1543,17 +1544,17 @@ ULONGLONG GetRealSectorForDirectWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgInde
 		DPBitmap_Set(volumeInfo->BitmapUsed, orgIndex, TRUE);
 		DPBitmap_Set(volumeInfo->BitmapRedirectUsed, orgIndex, TRUE);
 		*modifyType = 1; // 向反向重定向表添加一条orgIndex到-1的映射
-		return -1;
+		return (ULONGLONG)-1;
 	}
 
 	// 此扇区是否被重定向使用
 	if (DPBitmap_Test(volumeInfo->BitmapRedirectUsed, orgIndex))
 	{
-		ULONGLONG oldSector = -1; // 原扇区
+		ULONGLONG oldSector = (ULONGLONG)-1; // 原扇区
 		RedirectTable_Lookup(&volumeInfo->ReverseRedirectMap, orgIndex, &oldSector, nextCount, NULL);
 		if (oldSector == -1) // 之前是空闲状态，无需处理
 		{
-			return -1;
+			return (ULONGLONG)-1;
 		}
 		if (nextCount)
 			*nextCount = 0;
@@ -1652,7 +1653,7 @@ NTSTATUS PrepareForDirectWriteRequest(
 			prevIndex = realIndex;
 			prevOffset = physicalOffset;
 			prevBuffer = buff;
-			totalProcessBytes = bytesPerSector * curCount;
+			totalProcessBytes = bytesPerSector * (ULONG)curCount;
 			prevModifyType = modifyType;
 
 			isFirstBlock = FALSE;
@@ -1667,7 +1668,7 @@ NTSTATUS PrepareForDirectWriteRequest(
 				prevIndex = realIndex;
 			else
 				prevIndex = realIndex + curCount - 1;
-			totalProcessBytes += bytesPerSector * curCount;
+			totalProcessBytes += bytesPerSector * (ULONG)curCount;
 			goto __next;
 		}
 		// 处理上次连续需要处理的簇, 重置isFirstBlock
@@ -1681,14 +1682,14 @@ NTSTATUS PrepareForDirectWriteRequest(
 			// 判断是否要加入重定向列表和反向重定向列表
 			if (prevModifyType == 1)
 			{
-				RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, prevStart, -1, totalProcessBytes / bytesPerSector, NULL);
+				RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, prevStart, (ULONGLONG)-1, totalProcessBytes / bytesPerSector, NULL);
 			}
 			else if (prevModifyType == 2)
 			{
 				if (prevIndex != -1)
 					UpdateRedirectRecord(volumeInfo, prevStart, prevOffset / bytesPerSector, totalProcessBytes / bytesPerSector);
 				else
-					UpdateRedirectRecord(volumeInfo, prevStart, -1, totalProcessBytes / bytesPerSector);
+					UpdateRedirectRecord(volumeInfo, prevStart, (ULONGLONG)-1, totalProcessBytes / bytesPerSector);
 			}
 			else if (prevModifyType == 3)
 			{
@@ -1709,14 +1710,14 @@ NTSTATUS PrepareForDirectWriteRequest(
 			// 判断是否要加入重定向列表和反向重定向列表
 			if (prevModifyType == 1)
 			{
-				RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, prevStart, -1, totalProcessBytes / bytesPerSector, NULL);
+				RedirectTable_Insert(&volumeInfo->ReverseRedirectMap, prevStart, (ULONGLONG)-1, totalProcessBytes / bytesPerSector, NULL);
 			}
 			else if (prevModifyType == 2)
 			{
 				if (prevIndex != -1)
 					UpdateRedirectRecord(volumeInfo, prevStart, prevOffset / bytesPerSector, totalProcessBytes / bytesPerSector);
 				else
-					UpdateRedirectRecord(volumeInfo, prevStart, -1, totalProcessBytes / bytesPerSector);
+					UpdateRedirectRecord(volumeInfo, prevStart, (ULONGLONG)-1, totalProcessBytes / bytesPerSector);
 			}
 			else if (prevModifyType == 3)
 			{
@@ -1730,7 +1731,7 @@ NTSTATUS PrepareForDirectWriteRequest(
 		// 跳到下一个扇区, 处理剩余的数据
 		logicOffset += (ULONGLONG)bytesPerSector * curCount;
 		buff = (char *)buff + bytesPerSector * curCount;
-		length -= bytesPerSector * curCount;
+		length -= bytesPerSector * (ULONG)curCount;
 	}
 	__free(buff_mem);
 	return status;
@@ -1746,6 +1747,12 @@ NTSTATUS HandleDirectDiskRequest(
 {
 	NTSTATUS	status;
 
+	//未对齐读写操作，返回错误不处理
+	if (logicOffset % volumeInfo->BytesPerSector || length % volumeInfo->BytesPerSector)
+	{
+		LogWarn("Unaligned direct write to disk %lu partition %lu, offset %llu length %lu\n", volumeInfo->DiskNumber, volumeInfo->PartitionNumber, logicOffset, length);
+		return STATUS_INVALID_DEVICE_REQUEST;
+	}
 	// 只处理对硬盘直接写的操作
 	if (IRP_MJ_WRITE == majorFunction)
 	{
@@ -1845,7 +1852,7 @@ void SaveVolumeData(PVOLUME_INFO volumeInfo)
 	{
 		PLIST_ENTRY Entry = RemoveHeadList(&RedirectQueue);
 		REDIRECT_QUEUE_ITEM *Item = CONTAINING_RECORD(Entry, REDIRECT_QUEUE_ITEM, ListEntry);
-		ULONG Length = Item->Iterator->Length * volumeInfo->BytesPerSector;
+		ULONG Length = (ULONG)Item->Iterator->Length * volumeInfo->BytesPerSector;
 		char * buff = (char *)__malloc(Length);
 		if (buff)
 		{
@@ -1855,12 +1862,12 @@ void SaveVolumeData(PVOLUME_INFO volumeInfo)
 				status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], IRP_MJ_WRITE, volumeInfo->StartOffset + Item->Iterator->OrigStart * volumeInfo->BytesPerSector, buff, Length, TRUE);
 				if (!NT_SUCCESS(status))
 				{
-					LogErr("Write sector failed (StartOffset=%llu,Length=%lu), error code=0x%.8X\n", volumeInfo->StartOffset / volumeInfo->BytesPerSector + Item->Iterator->OrigStart, Item->Iterator->Length, status);
+					LogErr("Write sector failed (StartOffset=%llu,Length=%llu), error code=0x%.8X\n", volumeInfo->StartOffset / volumeInfo->BytesPerSector + Item->Iterator->OrigStart, Item->Iterator->Length, status);
 				}
 			}
 			else
 			{
-				LogErr("Read sector failed (StartOffset=%llu,Length=%lu), error code=0x%.8X\n", volumeInfo->StartOffset / volumeInfo->BytesPerSector + Item->Iterator->NewStart, Item->Iterator->Length, status);
+				LogErr("Read sector failed (StartOffset=%llu,Length=%llu), error code=0x%.8X\n", volumeInfo->StartOffset / volumeInfo->BytesPerSector + Item->Iterator->NewStart, Item->Iterator->Length, status);
 			}
 			__free(buff);
 		}
@@ -1880,12 +1887,12 @@ void SaveVolumeData(PVOLUME_INFO volumeInfo)
 			if (DPBitmap_Test(volumeInfo->BitmapRedirect, NewIndex))
 				DPBitmap_Set(BitmapDepends, NewIndex, FALSE);
 		}
-		for (ULONG i = 0; i < Item->Iterator->Length; i++)
+		for (ULONGLONG i = 0; i < Item->Iterator->Length; i++)
 		{
 			ULONGLONG NewIndex = Item->Iterator->NewStart + i;
 			if (DPBitmap_Test(volumeInfo->BitmapRedirect, NewIndex))
 			{
-				ULONGLONG MapIndex = -1;
+				ULONGLONG MapIndex = (ULONGLONG)-1;
 				ULONGLONG NextCount = 0;
 				PREDIRECT_TABLE_NODE NewIterator = NULL;
 				RedirectTable_Lookup(&volumeInfo->RedirectMap, NewIndex, &MapIndex, &NextCount, &NewIterator);
@@ -1998,12 +2005,12 @@ void ThreadReadWrite(PVOID Context)
 			KeSetEvent(&volume_info->FinishSaveDataEvent, (KPRIORITY)0, FALSE);
 		}
 		//从请求队列的首部拿出一个请求来准备处理，这里使用了自旋锁机制，所以不会有冲突
-		while (ReqEntry = ExInterlockedRemoveHeadList(
+		while ((ReqEntry = ExInterlockedRemoveHeadList(
 			&volume_info->ListHead,
 			&volume_info->ListLock
-		))
+		)) != NULL)
 		{
-			void * newbuff = NULL;
+			void * newbuff = NULL, *bufaddr = NULL;
 
 			//从队列的入口里找到实际的irp的地址
 			Irp = CONTAINING_RECORD(ReqEntry, IRP, Tail.Overlay.ListEntry);
@@ -2026,7 +2033,6 @@ void ThreadReadWrite(PVOID Context)
 			else
 			{
 				//除此之外，offset和length都是0
-				cacheOffset.QuadPart = 0;
 				offset.QuadPart = 0;
 				length = 0;
 			}
@@ -2039,9 +2045,6 @@ void ThreadReadWrite(PVOID Context)
 				IoCompleteRequest(Irp, IO_NO_INCREMENT);
 				continue;
 			}
-
-			// 得到在卷中的偏移 磁盘偏移-卷逻辑偏移
-			cacheOffset.QuadPart = offset.QuadPart - volume_info->StartOffset;
 
 			if (Irp->MdlAddress)
 			{
@@ -2064,46 +2067,107 @@ void ThreadReadWrite(PVOID Context)
 			// 不能和上次传来的buffer用同一个缓冲区，不然
 			// 会出现 PFN_LIST_CORRUPT (0x99, ...) A PTE or PFN is corrupt 错误
 			// 频繁申请内存也不是办法，用缓冲池吧
-			newbuff = __malloc(length);
+			newbuff = bufaddr = __malloc(length);
 
-			if (newbuff)
+			if (bufaddr)
 			{
-				// 停止保护状态
-				if (!volume_info->Protect)
+				// 停止保护状态或直接读写
+				if (!volume_info->Protect || IsDirectDiskDevice(io_stack->DeviceObject))
 				{
-					status = FastFsdRequest(LowerDeviceObject[volume_info->DiskNumber], io_stack->MajorFunction, offset.QuadPart, newbuff, length, TRUE);
-				}
-				else if (IRP_MJ_READ == io_stack->MajorFunction)
-				{
+					status = STATUS_SUCCESS;
 					if (IsDirectDiskDevice(io_stack->DeviceObject))
 					{
-						if (AllowDirectMount)
-							status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
-								newbuff, length);
-						else
+						if (!AllowDirectMount)
 							status = STATUS_INVALID_DEVICE_REQUEST;
+						else if (!volume_info->Protect)
+							offset.QuadPart += volume_info->StartOffset;
 					}
-					else
-						status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
-							newbuff, length);
-					RtlCopyMemory(buffer, newbuff, length);
+					if (NT_SUCCESS(status))
+					{
+						if (IRP_MJ_READ == io_stack->MajorFunction)
+						{
+							if (!volume_info->Protect)
+								status = FastFsdRequest(LowerDeviceObject[volume_info->DiskNumber], io_stack->MajorFunction, offset.QuadPart,
+									newbuff, length, TRUE);
+							else
+								status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
+									newbuff, length);
+							RtlCopyMemory(buffer, newbuff, length);
+						}
+						else
+						{
+							RtlCopyMemory(newbuff, buffer, length);
+							if (!volume_info->Protect)
+								status = FastFsdRequest(LowerDeviceObject[volume_info->DiskNumber], io_stack->MajorFunction, offset.QuadPart,
+									newbuff, length, TRUE);
+							else
+								status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
+									newbuff, length);
+						}
+					}
 				}
 				else
 				{
-					RtlCopyMemory(newbuff, buffer, length);
-					if (IsDirectDiskDevice(io_stack->DeviceObject))
+					ULONG tempLength = length;
+					//读写操作不被分区完整包含，特殊处理
+					if (offset.QuadPart < volume_info->StartOffset && offset.QuadPart + tempLength > volume_info->StartOffset)
 					{
-						if (AllowDirectMount)
-							status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
-								newbuff, length);
+						LogInfo("Outbound read/write to disk %lu partition %lu, offset %llu length %lu\n", volume_info->DiskNumber, volume_info->PartitionNumber, offset.QuadPart, length);
+						ULONG BufferLength = (ULONG)(volume_info->StartOffset - offset.QuadPart);
+						if (IRP_MJ_READ == io_stack->MajorFunction)
+						{
+							status = FastFsdRequest(io_stack->DeviceObject, io_stack->MajorFunction, offset.QuadPart,
+								newbuff, BufferLength, TRUE, FALSE);
+							RtlCopyMemory(buffer, newbuff, BufferLength);
+						}
 						else
-							status = STATUS_INVALID_DEVICE_REQUEST;
+						{
+							RtlCopyMemory(newbuff, buffer, BufferLength);
+							status = FastFsdRequest(io_stack->DeviceObject, io_stack->MajorFunction, offset.QuadPart,
+								newbuff, BufferLength, TRUE, io_stack->Flags & SL_FORCE_DIRECT_WRITE);
+						}
+						offset.QuadPart += BufferLength;
+						buffer = (PUCHAR)buffer + BufferLength;
+						newbuff = (PUCHAR)newbuff + BufferLength;
+						tempLength -= BufferLength;
+					}
+					// 得到在卷中的偏移 磁盘偏移-卷逻辑偏移
+					cacheOffset.QuadPart = offset.QuadPart - volume_info->StartOffset;
+					ULONG curLength = (ULONG)min(tempLength, volume_info->BytesTotal - cacheOffset.QuadPart);
+					if (IRP_MJ_READ == io_stack->MajorFunction)
+					{
+						status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
+							newbuff, curLength);
+						RtlCopyMemory(buffer, newbuff, curLength);
 					}
 					else
+					{
+						RtlCopyMemory(newbuff, buffer, curLength);
 						status = HandleDiskRequest(volume_info, io_stack->MajorFunction, cacheOffset.QuadPart,
-							newbuff, length);
+							newbuff, curLength);
+					}
+					//读写操作不被分区完整包含，特殊处理
+					if (cacheOffset.QuadPart + tempLength > volume_info->BytesTotal)
+					{
+						LogInfo("Outbound read/write to disk %lu partition %lu, offset %llu length %lu\n", volume_info->DiskNumber, volume_info->PartitionNumber, offset.QuadPart, length);
+						ULONGLONG NewOffset = volume_info->StartOffset + volume_info->BytesTotal;
+						ULONG BufferOffset = (ULONG)(NewOffset - offset.QuadPart);
+						ULONG NewLength = tempLength - BufferOffset;
+						if (IRP_MJ_READ == io_stack->MajorFunction)
+						{
+							status = FastFsdRequest(io_stack->DeviceObject, io_stack->MajorFunction, NewOffset,
+								(PUCHAR)newbuff + BufferOffset, NewLength, TRUE, FALSE);
+							RtlCopyMemory((PUCHAR)buffer + BufferOffset, (PUCHAR)newbuff + BufferOffset, NewLength);
+						}
+						else
+						{
+							RtlCopyMemory((PUCHAR)newbuff + BufferOffset, (PUCHAR)buffer + BufferOffset, NewLength);
+							status = FastFsdRequest(io_stack->DeviceObject, io_stack->MajorFunction, NewOffset,
+								(PUCHAR)newbuff + BufferOffset, NewLength, TRUE, io_stack->Flags & SL_FORCE_DIRECT_WRITE);
+						}
+					}
 				}
-				__free(newbuff);
+				__free(bufaddr);
 			}
 			else
 			{
@@ -2196,10 +2260,27 @@ OnDiskFilterReadWrite(
 		if (ProtectVolumeList[i].DiskNumber != DeviceNumber || !ProtectVolumeList[i].Protect)
 			continue;
 
-		if ((offset.QuadPart >= ProtectVolumeList[i].StartOffset) &&
-			((offset.QuadPart - ProtectVolumeList[i].StartOffset) < ProtectVolumeList[i].BytesTotal)
+		if ((offset.QuadPart >= ProtectVolumeList[i].StartOffset &&
+			offset.QuadPart - ProtectVolumeList[i].StartOffset < ProtectVolumeList[i].BytesTotal) || //读写操作头部被分区完整包含
+			(offset.QuadPart < ProtectVolumeList[i].StartOffset && offset.QuadPart + length > ProtectVolumeList[i].StartOffset) //读写操作尾部被分区完整包含
 			)
 		{
+			//未对齐读写操作，返回错误不处理
+			if (offset.QuadPart % ProtectVolumeList[i].BytesPerSector || length % ProtectVolumeList[i].BytesPerSector)
+			{
+				*Status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+				IoCompleteRequest(Irp, IO_NO_INCREMENT);
+				LogWarn("Unaligned read/write to disk %lu, offset %llu length %lu\n", DeviceNumber, offset.QuadPart, length);
+				return TRUE;
+			}
+			/*//读写操作不被分区完整包含，返回错误不处理
+			if (offset.QuadPart - ProtectVolumeList[i].StartOffset + length > ProtectVolumeList[i].BytesTotal)
+			{
+				*Status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+				IoCompleteRequest(Irp, IO_NO_INCREMENT);
+				LogWarn("Outbound read/write to disk %lu partition %lu, offset %llu length %lu\n", DeviceNumber, ProtectVolumeList[i].PartitionNumber, offset.QuadPart, length);
+				return TRUE;
+			}*/
 			//这个卷在保护状态，
 			//我们首先把这个irp设为pending状态
 			IoMarkIrpPending(Irp);
@@ -2221,6 +2302,14 @@ OnDiskFilterReadWrite(
 			// TRUE表始IPR被拦截
 			return TRUE;
 		}
+		/*//读写操作不被分区完整包含，返回错误不处理
+		if (offset.QuadPart < ProtectVolumeList[i].StartOffset && (offset.QuadPart + length) > ProtectVolumeList[i].StartOffset)
+		{
+			*Status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+			IoCompleteRequest(Irp, IO_NO_INCREMENT);
+			LogWarn("Outbound read/write to disk %lu partition %lu, offset %llu length %lu\n", DeviceNumber, ProtectVolumeList[i].PartitionNumber, offset.QuadPart, length);
+			return TRUE;
+		}*/
 	}
 
 	// 保护硬盘上的特定扇区（MBR和GPT分区表,保留扇区,EBR）
@@ -2230,6 +2319,14 @@ OnDiskFilterReadWrite(
 		ULONGLONG cacheOffset = offset.QuadPart;
 		ULONG bytesPerSector = ProtectDiskList[DeviceNumber].BytesPerSector;
 		PDP_BITMAP bitmap = ProtectDiskList[DeviceNumber].BitmapDeny;
+		//未对齐读写操作，返回错误不处理
+		if (offset.QuadPart % bytesPerSector || length % bytesPerSector)
+		{
+			*Status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+			IoCompleteRequest(Irp, IO_NO_INCREMENT);
+			LogWarn("Unaligned write to disk %lu, offset %llu length %lu\n", DeviceNumber, offset.QuadPart, length);
+			return TRUE;
+		}
 		while (cacheLength)
 		{
 			ULONGLONG sectorIndex = cacheOffset / bytesPerSector;
@@ -2265,6 +2362,7 @@ OnDiskFilterDeviceControl(
 {
 	UNREFERENCED_PARAMETER(DeviceType);
 	UNREFERENCED_PARAMETER(DeviceObject);
+	UNREFERENCED_PARAMETER(PartitionNumber);
 	PIO_STACK_LOCATION StackLocation = IoGetCurrentIrpStackLocation(Irp);
 	ULONG ControlCode = StackLocation->Parameters.DeviceIoControl.IoControlCode;
 
@@ -2343,7 +2441,6 @@ OnDiskFilterDispatchControl(
 		case DISKFILTER_IOCTL_DRIVER_CONTROL:
 			if (InBufferLength == sizeof(DISKFILTER_CONTROL))
 			{
-				LogInfo("ControlCode=0x%.8X, InBufferLength=%ld OutBufferLength=%ld\n", ControlCode, InBufferLength, OutBufferLength);
 				PDISKFILTER_CONTROL Data = (PDISKFILTER_CONTROL)SystemBuffer;
 				if (RtlEqualMemory(Data->AuthorizationContext, DiskFilter_AuthorizationContext, 128))
 				{
@@ -2394,7 +2491,7 @@ OnDiskFilterDispatchControl(
 					{
 						*Status = STATUS_ACCESS_DENIED;
 						if (IsProtect)
-							LogErrorMessageWithString(FilterDevice, MSG_FAILED_LOGIN_ATTEMPT, Data->Password, wcslen(Data->Password));
+							LogErrorMessageWithString(FilterDevice, MSG_FAILED_LOGIN_ATTEMPT, Data->Password, (ULONG)wcslen(Data->Password));
 						break;
 					}
 					switch (Data->ControlCode)
@@ -2416,7 +2513,7 @@ OnDiskFilterDispatchControl(
 						RtlCopyMemory(&NewConfig, &Data->Config, sizeof(NewConfig));
 						if (IsValidConfig(&NewConfig))
 						{
-							UCHAR Mask = PROTECTION_ALLOW_DRIVER_LOAD | PROTECTION_DRIVER_WHITELIST | PROTECTION_DRIVER_BLACKLIST;
+							UCHAR Mask = (UCHAR)(PROTECTION_ALLOW_DRIVER_LOAD | PROTECTION_DRIVER_WHITELIST | PROTECTION_DRIVER_BLACKLIST);
 							UCHAR NewFlags = (Config.ProtectionFlags & ~Mask) | (NewConfig.ProtectionFlags & Mask);
 							InterlockedExchange8((PCHAR)&Config.ProtectionFlags, NewFlags);
 							ExAcquireResourceExclusiveLite(&DriverListLock, TRUE);
@@ -2435,7 +2532,7 @@ OnDiskFilterDispatchControl(
 							CurStatus.AllowDriverLoad = AllowLoadDriver;
 							CurStatus.ProtectEnabled = IsProtect;
 							CurStatus.DirectMountEnabled = AllowDirectMount;
-							CurStatus.ProtectVolumeCount = ValidVolumeCount;
+							CurStatus.ProtectVolumeCount = (UCHAR)ValidVolumeCount;
 							for (UCHAR i = 0; i < ValidVolumeCount; i++)
 							{
 								CurStatus.ProtectVolume[i] = DISKFILTER_MAKE_VOLNUM(ProtectVolumeList[i].DiskNumber, ProtectVolumeList[i].PartitionNumber);
@@ -2483,7 +2580,7 @@ OnDiskFilterDispatchControl(
 							InterlockedIncrement((PLONG)&DirectDiskCount);
 							WCHAR strMsg[512];
 							swprintf_s(strMsg, 512, L"(%lu,%lu)", DirectDiskInfo.DiskNumber, DirectDiskInfo.PartitionNumber);
-							LogErrorMessageWithString(FilterDevice, MSG_DIRECT_MOUNT_OK, strMsg, wcslen(strMsg));
+							LogErrorMessageWithString(FilterDevice, MSG_DIRECT_MOUNT_OK, strMsg, (ULONG)wcslen(strMsg));
 						}
 						break;
 					}
@@ -2503,15 +2600,15 @@ OnDiskFilterDispatchControl(
 							break;
 						}
 						DISKFILTER_DIRECTDISK DirectDiskCfg;
-						DirectDiskCfg.DiskNumber = -1;
-						DirectDiskCfg.PartitionNumber = -1;
+						DirectDiskCfg.DiskNumber = (ULONG)-1;
+						DirectDiskCfg.PartitionNumber = (ULONG)-1;
 						DirectDiskGetConfig(DirectDiskDev, &DirectDiskCfg);
 						*Status = DirectDiskUnmount(DirectDiskDev);
 						if (NT_SUCCESS(*Status))
 						{
 							WCHAR strMsg[512];
 							swprintf_s(strMsg, 512, L"(%lu,%lu)", DirectDiskCfg.DiskNumber, DirectDiskCfg.PartitionNumber);
-							LogErrorMessageWithString(FilterDevice, MSG_DIRECT_UNMOUNT_OK, strMsg, wcslen(strMsg));
+							LogErrorMessageWithString(FilterDevice, MSG_DIRECT_UNMOUNT_OK, strMsg, (ULONG)wcslen(strMsg));
 						}
 						break;
 					}
@@ -2520,22 +2617,22 @@ OnDiskFilterDispatchControl(
 						{
 							DISKFILTER_DIRECTDISK_STATUS CurStatus;
 							RtlZeroMemory(&CurStatus, sizeof(CurStatus));
-							PDEVICE_OBJECT DeviceObject;
+							PDEVICE_OBJECT CurDeviceObject;
 							ULONG TotalCount = 0;
-							DeviceObject = FilterDevice->DriverObject->DeviceObject;
-							while (DeviceObject)
+							CurDeviceObject = FilterDevice->DriverObject->DeviceObject;
+							while (CurDeviceObject)
 							{
-								if (IsDirectDiskDevice(DeviceObject))
+								if (IsDirectDiskDevice(CurDeviceObject))
 								{
 									if (TotalCount < sizeof(CurStatus.MountVolume) / sizeof(*CurStatus.MountVolume))
 									{
-										DirectDiskGetConfig(DeviceObject, &CurStatus.MountVolume[TotalCount]);
+										DirectDiskGetConfig(CurDeviceObject, &CurStatus.MountVolume[TotalCount]);
 										TotalCount++;
 									}
 								}
-								DeviceObject = DeviceObject->NextDevice;
+								CurDeviceObject = CurDeviceObject->NextDevice;
 							}
-							CurStatus.MountVolumeCount = TotalCount;
+							CurStatus.MountVolumeCount = (UCHAR)TotalCount;
 							RtlCopyMemory(SystemBuffer, &CurStatus, sizeof(CurStatus));
 							info = sizeof(CurStatus);
 							*Status = STATUS_SUCCESS;
@@ -2564,7 +2661,7 @@ OnDiskFilterDispatchControl(
 						*Status = STATUS_SUCCESS;
 						WCHAR strMsg[512];
 						swprintf_s(strMsg, 512, L"(%lu,%lu)", SaveDataInfo.DiskNumber, SaveDataInfo.PartitionNumber);
-						LogErrorMessageWithString(FilterDevice, MSG_SET_SAVEDATA_OK, strMsg, wcslen(strMsg));
+						LogErrorMessageWithString(FilterDevice, MSG_SET_SAVEDATA_OK, strMsg, (ULONG)wcslen(strMsg));
 						break;
 					}
 					case DISKFILTER_CONTROL_CANCEL_SAVE_DATA:
@@ -2581,7 +2678,7 @@ OnDiskFilterDispatchControl(
 						*Status = STATUS_SUCCESS;
 						WCHAR strMsg[512];
 						swprintf_s(strMsg, 512, L"(%lu,%lu)", SaveDataInfo.DiskNumber, SaveDataInfo.PartitionNumber);
-						LogErrorMessageWithString(FilterDevice, MSG_CANCEL_SAVEDATA_OK, strMsg, wcslen(strMsg));
+						LogErrorMessageWithString(FilterDevice, MSG_CANCEL_SAVEDATA_OK, strMsg, (ULONG)wcslen(strMsg));
 						break;
 					}
 					case DISKFILTER_CONTROL_GET_SAVE_DATA:
@@ -2589,9 +2686,7 @@ OnDiskFilterDispatchControl(
 						{
 							DISKFILTER_SAVEDATA_STATUS CurStatus;
 							RtlZeroMemory(&CurStatus, sizeof(CurStatus));
-							PDEVICE_OBJECT DeviceObject;
 							ULONG TotalCount = 0;
-							DeviceObject = FilterDevice->DriverObject->DeviceObject;
 							for (UINT i = 0; i < ValidVolumeCount; i++)
 							{
 								if (ProtectVolumeList[i].ShutdownSaveData && ProtectVolumeList[i].CanSaveData)
@@ -2604,7 +2699,7 @@ OnDiskFilterDispatchControl(
 									}
 								}
 							}
-							CurStatus.SaveDataCount = TotalCount;
+							CurStatus.SaveDataCount = (UCHAR)TotalCount;
 							RtlCopyMemory(SystemBuffer, &CurStatus, sizeof(CurStatus));
 							info = sizeof(CurStatus);
 							*Status = STATUS_SUCCESS;
@@ -2757,6 +2852,7 @@ void LoadDriverNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_IN
 VOID
 OnDiskFilterUnload(PDRIVER_OBJECT DriverObject)
 {
+	UNREFERENCED_PARAMETER(DriverObject);
 	UNICODE_STRING dosDeviceName;
 
 	RtlInitUnicodeString(&dosDeviceName, DISKFILTER_DOS_DEVICE_NAME_W);
@@ -2861,38 +2957,6 @@ OnDiskFilterInitialization(
 
 	LogInfo("Driver loaded\n");
 
-	RtlInitUnicodeString(&ntDeviceName, DISKFILTER_DEVICE_NAME_W);
-
-	RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-
-	status = IoCreateDeviceSecure(
-		DriverObject,
-		0,								// DeviceExtensionSize
-		&ntDeviceName,					// DeviceName
-		FILE_DEVICE_DISKFLT,			// DeviceType
-		0,								// DeviceCharacteristics
-		TRUE,							// Exclusive
-		&sddl,							// DefaultSDDLString
-		NULL,							// DeviceClassGuid
-		&deviceObject					// [OUT]
-	);
-
-	if (!NT_SUCCESS(status))
-	{
-		LogErr("IoCreateDevice failed. status = 0x%.8X\n", status);
-		goto failed;
-	}
-
-	RtlInitUnicodeString(&dosDeviceName, DISKFILTER_DOS_DEVICE_NAME_W);
-
-	status = IoCreateSymbolicLink(&dosDeviceName, &ntDeviceName);
-	if (!NT_SUCCESS(status))
-	{
-		LogErr("IoCreateSymbolicLink failed. status = 0x%.8X\n", status);
-		LogErrorMessage(deviceObject, MSG_FAILED_TO_INIT);
-		goto failed;
-	}
-
 	mempool_init();
 
 	FilterDevice = NULL;
@@ -2915,8 +2979,40 @@ OnDiskFilterInitialization(
 	DisableStartupMessage = 0;
 	DisableShutdownMessage = 0;
 
+	RtlInitUnicodeString(&ntDeviceName, DISKFILTER_DEVICE_NAME_W);
+
+	RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+
+	status = IoCreateDeviceSecure(
+		DriverObject,
+		0,								// DeviceExtensionSize
+		&ntDeviceName,					// DeviceName
+		FILE_DEVICE_DISKFLT,			// DeviceType
+		0,								// DeviceCharacteristics
+		TRUE,							// Exclusive
+		&sddl,							// DefaultSDDLString
+		NULL,							// DeviceClassGuid
+		&deviceObject					// [OUT]
+	);
+
+	if (!NT_SUCCESS(status))
+	{
+		LogErr("IoCreateDevice failed. status = 0x%.8X\n", status);
+		return NULL;
+	}
+
+	RtlInitUnicodeString(&dosDeviceName, DISKFILTER_DOS_DEVICE_NAME_W);
+
+	status = IoCreateSymbolicLink(&dosDeviceName, &ntDeviceName);
+	if (!NT_SUCCESS(status))
+	{
+		LogErr("IoCreateSymbolicLink failed. status = 0x%.8X\n", status);
+		LogErrorMessage(deviceObject, MSG_FAILED_TO_INIT);
+		goto failed;
+	}
+
 	WCHAR strAppend[] = L"\\Parameters";
-	ULONG TotalLen = RegistryPath->Length / 2 + wcslen(strAppend) + 10;
+	SIZE_T TotalLen = RegistryPath->Length / 2 + wcslen(strAppend) + 10;
 	PWCHAR strRegPath = (PWCHAR)__malloc(TotalLen * sizeof(WCHAR));
 	if (strRegPath)
 	{

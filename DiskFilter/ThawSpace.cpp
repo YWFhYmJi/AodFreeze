@@ -878,7 +878,6 @@ ThawSpaceOpenFile(
 	PDEVICE_EXTENSION               device_extension;
 	NTSTATUS                        status;
 	OBJECT_ATTRIBUTES               object_attributes;
-	FILE_END_OF_FILE_INFORMATION    file_eof;
 	FILE_BASIC_INFORMATION          file_basic;
 	FILE_STANDARD_INFORMATION       file_standard;
 	FILE_ALIGNMENT_INFORMATION      file_alignment;
