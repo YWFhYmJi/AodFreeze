@@ -191,7 +191,7 @@ __cdecl atexit(
 	__in VOID(__cdecl* destructor)(VOID)
 );
 
-#if defined(_IA64_) || defined(_AMD64_)
+#if defined(_IA64_) || defined(_AMD64_) || defined(_ARM64_)
 #pragma section(".CRT$XCA",long,read)
 extern __declspec(allocate(".CRT$XCA")) VOID(*__ctors_begin__[1])(VOID);
 #pragma section(".CRT$XCZ",long,read)

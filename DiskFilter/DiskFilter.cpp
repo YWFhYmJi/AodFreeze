@@ -167,6 +167,7 @@ NTSTATUS GetVolumeInfo(ULONG DiskNum, DWORD PartitionNum, PVOLUME_INFO info)
 		
 		if (!NT_SUCCESS(status))
 		{
+			ZwClose(fileHandle);
 			return status;
 		}
 
@@ -181,6 +182,7 @@ NTSTATUS GetVolumeInfo(ULONG DiskNum, DWORD PartitionNum, PVOLUME_INFO info)
 		{
 			info->BytesPerSector = sizeoInfo.BytesPerSector;
 			info->BytesPerCluster = sizeoInfo.BytesPerSector * sizeoInfo.SectorsPerAllocationUnit;
+			info->VolumeDevice = GetVolumeDeviceByFileHandle(fileHandle);
 		}
 		else
 		{
@@ -538,6 +540,17 @@ PVOLUME_INFO FindProtectVolume(ULONG DiskNum, DWORD PartitionNum)
 	for (UINT i = 0; i < ValidVolumeCount; i++)
 	{
 		if (ProtectVolumeList[i].DiskNumber == DiskNum && ProtectVolumeList[i].PartitionNumber == PartitionNum)
+			return &(ProtectVolumeList[i]);
+	}
+	return NULL;
+}
+
+// 根据设备对象获取保护卷
+PVOLUME_INFO FindProtectVolumeByDevice(PDEVICE_OBJECT VolumeDevice)
+{
+	for (UINT i = 0; i < ValidVolumeCount; i++)
+	{
+		if (ProtectVolumeList[i].VolumeDevice == VolumeDevice)
 			return &(ProtectVolumeList[i]);
 	}
 	return NULL;
@@ -1027,17 +1040,6 @@ void CheckThawSpace()
 					{
 						if (io_status.Information == FILE_CREATED)
 						{
-							FILE_END_OF_FILE_INFORMATION file_eof;
-							file_eof.EndOfFile.QuadPart = FileSize;
-
-							status = ZwSetInformationFile(
-								file_handle,
-								&io_status,
-								&file_eof,
-								sizeof(FILE_END_OF_FILE_INFORMATION),
-								FileEndOfFileInformation
-							);
-
 							LogInfo("ThawSpace %wZ: File not found, initializing disk file.\n", &file_name);
 							WCHAR VolumeLetter = (WCHAR)(((USHORT)Config.ThawSpacePath[i][MAX_PATH]) & ~DISKFILTER_THAWSPACE_HIDE);
 							// 写入初始化标记，防止因为错误导致无限重启初始化
@@ -1047,7 +1049,16 @@ void CheckThawSpace()
 							DisplayString(Buf);
 							{
 								LogInfo("Initializating disk file with size %llu\n", FileSize);
-								IO_STATUS_BLOCK IoStatus = { 0 };
+								// TODO: 修改初始化方式，不要填充磁盘
+								FILE_END_OF_FILE_INFORMATION file_eof;
+								file_eof.EndOfFile.QuadPart = FileSize;
+								status = ZwSetInformationFile(
+									file_handle,
+									&io_status,
+									&file_eof,
+									sizeof(FILE_END_OF_FILE_INFORMATION),
+									FileEndOfFileInformation
+								);
 								LARGE_INTEGER Offset = { 0 };
 								ULONG BufferSize = 20 * 1024 * 1024; // 20MB
 								PUCHAR Buffer = (PUCHAR)__malloc(BufferSize);
@@ -1058,7 +1069,7 @@ void CheckThawSpace()
 								{
 									ULONG WriteSize = (ULONG)min(BufferSize, FileSize - Cur);
 									Offset.QuadPart = Cur;
-									ZwWriteFile(file_handle, NULL, NULL, NULL, &IoStatus, Buffer, WriteSize, &Offset, NULL);
+									ZwWriteFile(file_handle, NULL, NULL, NULL, &io_status, Buffer, WriteSize, &Offset, NULL);
 									Cur += WriteSize;
 									int CurProgress = int(100 * Cur / FileSize);
 									if (LastProgress != CurProgress)
@@ -1070,6 +1081,7 @@ void CheckThawSpace()
 								}
 								__free(Buffer);
 								LogInfo("Fill file ok\n");
+
 								FormatFAT32FileSystem(file_handle, FileSize, "ThawSpace");
 								wcscpy(Buf, L"\rFinished initializing ThawSpace volume ?          \n");
 								*wcsrchr(Buf, L'?') = VolumeLetter;
@@ -1115,7 +1127,6 @@ __inline BOOL IsSectorAllow(PVOLUME_INFO volumeInfo, ULONGLONG index)
 // 判断文件是否可信（文件扇区是否未被重定向）
 NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 {
-	PFILE_OBJECT	fileObject = NULL;
 	PRETRIEVAL_POINTERS_BUFFER	pVcnPairs = NULL;
 	PVOLUME_INFO	volumeInfo = NULL;
 	ULONG	sectorsPerCluster;
@@ -1131,31 +1142,7 @@ NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 		goto out;
 	}
 
-	status = ObReferenceObjectByHandle(fileHandle, 0, NULL, KernelMode, (PVOID *)&fileObject, NULL);
-
-	if (!NT_SUCCESS(status))
-	{
-		LogWarn("Failed to get file object for file: %wZ, error code 0x%.8X\n", filePath, status);
-		goto out;
-	}
-
-	if (fileObject->DeviceObject->DeviceType != FILE_DEVICE_NETWORK_FILE_SYSTEM)
-	{
-		UNICODE_STRING	uniDosName;
-		// 得到类似C:这样的盘符，为了获取VolumeInfo
-		status = IoVolumeDeviceToDosName(fileObject->DeviceObject, &uniDosName);
-
-		if (NT_SUCCESS(status))
-		{
-			volumeInfo = VolumeList[toupper(*(WCHAR *)uniDosName.Buffer) - L'A'];
-			ExFreePool(uniDosName.Buffer);
-		}
-		else
-		{
-			LogWarn("Failed to read volume letter for file: %wZ\n", filePath);
-		}
-	}
-	ObDereferenceObject(fileObject);
+	volumeInfo = FindProtectVolumeByDevice(GetVolumeDeviceByFileHandle(fileHandle));
 
 	if (!volumeInfo)
 	{
@@ -1764,12 +1751,12 @@ NTSTATUS HandleDirectDiskRequest(
 }
 
 // 处理保存数据的操作
-void SaveVolumeData(PVOLUME_INFO volumeInfo)
+BOOLEAN SaveVolumeData(PVOLUME_INFO volumeInfo)
 {
 	if (!volumeInfo->CanSaveData)
 	{
 		LogWarn("Cannot save data on volume (%lu,%lu)\n", volumeInfo->DiskNumber, volumeInfo->PartitionNumber);
-		return;
+		return FALSE;
 	}
 	WCHAR VolName[50];
 	if (volumeInfo->Volume)
@@ -1792,7 +1779,7 @@ void SaveVolumeData(PVOLUME_INFO volumeInfo)
 		LogWarn("Failed to create bitmap, error code=0x%.8X\n", status);
 		swprintf_s(Buf, 256, L"\rFailed to save data on volume %ls. Error code=0x%.8X\n", VolName, status);
 		DisplayString(Buf);
-		return;
+		return FALSE;
 	}
 	for (PREDIRECT_TABLE_NODE Iterator = RedirectTable_NextIterator(&volumeInfo->RedirectMap, NULL);
 		Iterator;
@@ -1839,7 +1826,7 @@ void SaveVolumeData(PVOLUME_INFO volumeInfo)
 				}
 				swprintf_s(Buf, 256, L"\rFailed to save data on volume %ls. Failed to allocate memory.\n", VolName);
 				DisplayString(Buf);
-				return;
+				return FALSE;
 			}
 			item->Iterator = Iterator;
 			InitializeListHead(&item->ListEntry);
@@ -1848,6 +1835,7 @@ void SaveVolumeData(PVOLUME_INFO volumeInfo)
 	}
 	ULONGLONG TotalRedirectSectors = DPBitmap_Count(volumeInfo->BitmapRedirect, TRUE);
 	int LastProgress = -1;
+	BOOLEAN IsDirty = FALSE;
 	while (!IsListEmpty(&RedirectQueue))
 	{
 		PLIST_ENTRY Entry = RemoveHeadList(&RedirectQueue);
@@ -1877,6 +1865,7 @@ void SaveVolumeData(PVOLUME_INFO volumeInfo)
 		}
 		if (!NT_SUCCESS(status))
 		{
+			IsDirty = TRUE;
 			swprintf_s(Buf, 256, L"\rSave sector %llu->%llu (%lu) on volume %ls failed. Error code=0x%.8X\n", Item->Iterator->NewStart, Item->Iterator->OrigStart, Item->Iterator->Length, VolName, status);
 			DisplayString(Buf);
 		}
@@ -1919,12 +1908,14 @@ void SaveVolumeData(PVOLUME_INFO volumeInfo)
 						else
 						{
 							LogErr("Failed to allocate memory for queue item\n");
+							IsDirty = TRUE;
 						}
 					}
 				}
 				else
 				{
 					LogErr("No redirect matched with sector %llu\n", NewIndex);
+					IsDirty = TRUE;
 				}
 				i += NextCount;
 			}
@@ -1940,16 +1931,19 @@ void SaveVolumeData(PVOLUME_INFO volumeInfo)
 			DisplayString(Buf);
 		}
 	}
+	if (IsDirty)
+		DisplayString(L"\rVolume is dirty, please run chkdsk.        \n");
 	DPBitmap_Free(BitmapDepends);
-	volumeInfo->Protect = FALSE;
 	DPBitmap_Free(volumeInfo->BitmapUsed);
 	DPBitmap_Free(volumeInfo->BitmapRedirect);
 	DPBitmap_Free(volumeInfo->BitmapRedirectUsed);
 	DPBitmap_Free(volumeInfo->BitmapAllow);
 	RedirectTable_Free(&volumeInfo->RedirectMap);
 	RedirectTable_Free(&volumeInfo->ReverseRedirectMap);
+	// InterlockedExchange8((PCHAR)&volumeInfo->Protect, FALSE);
 	swprintf_s(Buf, 256, L"\rFinished saving data on volume %ls         \n", VolName);
 	DisplayString(Buf);
+	return TRUE;
 }
 
 // 读写操作线程
@@ -1971,9 +1965,10 @@ void ThreadReadWrite(PVOID Context)
 	ULONG				length = 0;
 	//irp要处理的偏移量
 	LARGE_INTEGER		offset = { 0 };
-
 	//irp要处理的偏移量
 	LARGE_INTEGER		cacheOffset = { 0 };
+	//是否停止保护
+	BOOLEAN				StopProtect = FALSE;
 
 	//设置这个线程的优先级
 	KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
@@ -1999,7 +1994,8 @@ void ThreadReadWrite(PVOID Context)
 		//保存数据
 		if (volume_info->SavingData)
 		{
-			SaveVolumeData(volume_info);
+			if (SaveVolumeData(volume_info))
+				StopProtect = TRUE;
 			volume_info->SavingData = FALSE;
 			volume_info->CanSaveData = FALSE;
 			KeSetEvent(&volume_info->FinishSaveDataEvent, (KPRIORITY)0, FALSE);
@@ -2072,21 +2068,21 @@ void ThreadReadWrite(PVOID Context)
 			if (bufaddr)
 			{
 				// 停止保护状态或直接读写
-				if (!volume_info->Protect || IsDirectDiskDevice(io_stack->DeviceObject))
+				if (StopProtect || IsDirectDiskDevice(io_stack->DeviceObject))
 				{
 					status = STATUS_SUCCESS;
 					if (IsDirectDiskDevice(io_stack->DeviceObject))
 					{
 						if (!AllowDirectMount)
 							status = STATUS_INVALID_DEVICE_REQUEST;
-						else if (!volume_info->Protect)
+						else if (StopProtect)
 							offset.QuadPart += volume_info->StartOffset;
 					}
 					if (NT_SUCCESS(status))
 					{
 						if (IRP_MJ_READ == io_stack->MajorFunction)
 						{
-							if (!volume_info->Protect)
+							if (StopProtect)
 								status = FastFsdRequest(LowerDeviceObject[volume_info->DiskNumber], io_stack->MajorFunction, offset.QuadPart,
 									newbuff, length, TRUE);
 							else
@@ -2097,7 +2093,7 @@ void ThreadReadWrite(PVOID Context)
 						else
 						{
 							RtlCopyMemory(newbuff, buffer, length);
-							if (!volume_info->Protect)
+							if (StopProtect)
 								status = FastFsdRequest(LowerDeviceObject[volume_info->DiskNumber], io_stack->MajorFunction, offset.QuadPart,
 									newbuff, length, TRUE);
 							else
@@ -2186,7 +2182,7 @@ void ThreadReadWrite(PVOID Context)
 			}
 
 			Irp->IoStatus.Status = status;
-			IoCompleteRequest(Irp, IO_NO_INCREMENT);
+			IoCompleteRequest(Irp, IO_DISK_INCREMENT);
 			continue;
 		// 处理请求失败，将请求直接交给下层设备处理
 		__failed:
@@ -2204,8 +2200,9 @@ void ThreadReadWrite(PVOID Context)
 			continue;
 		}
 		// 停止保护标志
-		if (!volume_info->Protect)
+		if (StopProtect)
 		{
+			InterlockedExchange8((PCHAR)&volume_info->Protect, FALSE);
 			PsTerminateSystemThread(STATUS_SUCCESS);
 			return;
 		}
@@ -2784,7 +2781,15 @@ void LoadDriverNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_IN
 			InitProtectVolumes();
 		}
 		IsInit = TRUE;
-		AllowLoadDriver = (Config.ProtectionFlags & PROTECTION_ALLOW_DRIVER_LOAD) ? TRUE : FALSE;
+
+		if (Config.ProtectionFlags & PROTECTION_ALLOW_DRIVER_LOAD) // 直接允许驱动加载
+			AllowLoadDriver = TRUE;
+		else if (Config.ProtectionFlags & PROTECTION_DRIVER_BLACKLIST) // 启用黑名单防护
+			AllowLoadDriver = FALSE;
+		else if ((Config.ProtectionFlags & PROTECTION_DRIVER_WHITELIST) && FindProtectVolumeByDevice(GetVolumeDeviceByFileName(FullImageName))) // 启用白名单防护，且系统分区被保护
+			AllowLoadDriver = FALSE;
+		else // 未启用防护或系统分区不被保护
+			AllowLoadDriver = TRUE;
 		return;
 	}
 
@@ -2821,6 +2826,7 @@ void LoadDriverNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_IN
 	}
 
 	// 禁止加载驱动
+#if defined(i386) || defined(AMD64)
 #ifdef AMD64
 	/*
 	B8 220000C0    mov     eax, C0000022h // STATUS_ACCESS_DENIED
@@ -2846,6 +2852,7 @@ void LoadDriverNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_IN
 			WriteReadOnlyMemory((PUCHAR)ImageInfo->ImageBase + ImageNtHeaders->OptionalHeader.AddressOfEntryPoint, PatchCode, sizeof(PatchCode) - 1);
 		}
 	}
+#endif
 }
 
 // 卸载驱动时被调用，由于是硬盘过滤驱动，此驱动不能被卸载
@@ -2879,6 +2886,11 @@ void DriverReinit(PDRIVER_OBJECT DriverObject, PVOID Context, ULONG Count)
 		LogErr("Failed to read protection config file (%wZ) ! status=0x%.8X\n", &ConfigPath, status);
 		LogErrorMessageWithString(FilterDevice, MSG_FAILED_TO_LOAD_CONFIG, ConfigPath.Buffer, ConfigPath.Length);
 		return;
+	}
+	// 让“不允许加载驱动”的选项在重启后失效，自动变为驱动白名单
+	if ((Config.ProtectionFlags & (PROTECTION_ALLOW_DRIVER_LOAD | PROTECTION_DRIVER_WHITELIST | PROTECTION_DRIVER_BLACKLIST)) == 0)
+	{
+		Config.ProtectionFlags |= PROTECTION_DRIVER_WHITELIST;
 	}
 	RtlCopyMemory(&NewConfig, &Config, sizeof(Config));
 

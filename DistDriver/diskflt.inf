@@ -8,7 +8,7 @@ Class=DiskDrive
 ClassGuid={4d36e967-e325-11ce-bfc1-08002be10318}
 Provider=%ManufacturerName%
 CatalogFile=diskflt.cat
-DriverVer = 06/08/2025,17.24.17.570
+DriverVer = 02/06/2026,10.1.34.581
 
 
 ; Distribution Media information
@@ -18,6 +18,9 @@ DriverVer = 06/08/2025,17.24.17.570
 
 [SourceDisksNames.amd64]
 1 = %diskflt.MediaDesc%,,,amd64
+
+[SourceDisksNames.arm64]
+1 = %diskflt.MediaDesc%,,,arm64
 
 
 [SourceDisksFiles]

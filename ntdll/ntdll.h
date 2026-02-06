@@ -28,7 +28,13 @@ extern "C" {
 
 
 #ifndef _NTDLL_SELF_                            // Auto-insert the library
+#if defined(_X86_)
 #pragma comment(lib, "Ntdll.lib")
+#elif defined(_AMD64_)
+#pragma comment(lib, "Ntdll64.lib")
+#elif defined(_ARM64_)
+#pragma comment(lib, "NtdllA64.lib")
+#endif
 #endif
 
 #pragma warning(disable: 4201)                  // nonstandard extension used : nameless struct/union

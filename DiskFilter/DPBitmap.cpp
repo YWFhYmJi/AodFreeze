@@ -125,7 +125,8 @@ ULONGLONG DPBitmap_FindNext(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 				continue;
 			}
 
-			if (set == ((((PULONG)bitMap->buffer[slot])[sIndex / 32] & (1 << (sIndex % 32))) > 0))
+			// if (set == ((((PULONG)bitMap->buffer[slot])[sIndex / 32] & (1 << (sIndex % 32))) > 0))
+			if (set == _bittest(&((PLONG)bitMap->buffer[slot])[sIndex / 32], sIndex % 32))
 			{
 				// 找到
 				return startIndex;
@@ -181,7 +182,8 @@ ULONGLONG DPBitmap_FindPrev(DP_BITMAP *bitMap, ULONGLONG startIndex, BOOL set)
 				continue;
 			}
 
-			if (set == ((((PULONG)bitMap->buffer[slot])[sIndex / 32] & (1 << (sIndex % 32))) > 0))
+			// if (set == ((((PULONG)bitMap->buffer[slot])[sIndex / 32] & (1 << (sIndex % 32))) > 0))
+			if (set == _bittest(&((PLONG)bitMap->buffer[slot])[sIndex / 32], sIndex % 32))
 			{
 				// 找到
 				return startIndex;
@@ -227,19 +229,23 @@ NTSTATUS DPBitmap_Set(DP_BITMAP *bitMap, ULONGLONG index, BOOL set)
 
 	if (set)
 	{
-		if (!(((ULONG *)bitMap->buffer[slot])[index / 32] & (1 << (index % 32))))
-		{
-			((ULONG *)bitMap->buffer[slot])[index / 32] |= (1 << (index % 32));
-			InterlockedIncrement64((LONGLONG *)&bitMap->bitMapUsed);
-		}
+		// if (!(((ULONG *)bitMap->buffer[slot])[index / 32] & (1 << (index % 32))))
+		// {
+		// 	((ULONG *)bitMap->buffer[slot])[index / 32] |= (1 << (index % 32));
+		// 	InterlockedIncrement64((LONGLONG *)&bitMap->bitMapUsed);
+		// }
+		if (!_bittestandset(&((PLONG)bitMap->buffer[slot])[index / 32], index % 32))
+		 	InterlockedIncrement64((PLONGLONG)&bitMap->bitMapUsed);
 	}
 	else
 	{
-		if (((ULONG *)bitMap->buffer[slot])[index / 32] & (1 << (index % 32)))
-		{
-			((ULONG *)bitMap->buffer[slot])[index / 32] &= ~(1 << (index % 32));
-			InterlockedDecrement64((LONGLONG *)&bitMap->bitMapUsed);
-		}
+		// if (((ULONG *)bitMap->buffer[slot])[index / 32] & (1 << (index % 32)))
+		// {
+		// 	((ULONG *)bitMap->buffer[slot])[index / 32] &= ~(1 << (index % 32));
+		// 	InterlockedDecrement64((LONGLONG *)&bitMap->bitMapUsed);
+		// }
+		if (_bittestandreset(&((PLONG)bitMap->buffer[slot])[index / 32], index % 32))
+			InterlockedDecrement64((PLONGLONG)&bitMap->bitMapUsed);
 	}
 
 	return STATUS_SUCCESS;
@@ -261,7 +267,8 @@ BOOL DPBitmap_Test(DP_BITMAP *bitMap, ULONGLONG index)
 
 	index %= bitMap->regionSize;
 
-	return (((ULONG *)bitMap->buffer[slot])[index / 32] & (1 << (index % 32)) ? TRUE : FALSE);
+	// return (((ULONG *)bitMap->buffer[slot])[index / 32] & (1 << (index % 32)) ? TRUE : FALSE);
+	return _bittest(&((PLONG)bitMap->buffer[slot])[index / 32], index % 32);
 }
 
 ULONGLONG DPBitmap_Count(DP_BITMAP *bitMap, BOOL set)

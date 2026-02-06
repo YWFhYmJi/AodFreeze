@@ -251,7 +251,7 @@ __cdecl atexit(
 	return 1;
 }
 
-#if defined(_IA64_) || defined(_AMD64_)
+#if defined(_IA64_) || defined(_AMD64_) || defined(_ARM64_)
 #pragma section(".CRT$XCA",long,read)
 __declspec(allocate(".CRT$XCA")) VOID(*__ctors_begin__[1])(VOID) = { 0 };
 #pragma section(".CRT$XCZ",long,read)

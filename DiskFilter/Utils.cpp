@@ -152,16 +152,21 @@ void SHA256(const PVOID lpData, SIZE_T ulSize, UCHAR lpOutput[32])
 
 BOOL bitmap_test(ULONG *bitmap, ULONGLONG index)
 {
-	//	return ((BYTE *)BitmapDetail)[Cluster / 8] & (1 << (Cluster % 8));
-	return ((bitmap[index / 8 / sizeof(ULONG)] & (1ul << (index % (8 * sizeof(ULONG))))) ? TRUE : FALSE);
+	// return ((BYTE *)BitmapDetail)[Cluster / 8] & (1 << (Cluster % 8));
+	// return ((bitmap[index / 8 / sizeof(ULONG)] & (1ul << (index % (8 * sizeof(ULONG))))) ? TRUE : FALSE);
+	return _bittest((LONG *)&bitmap[index / 8 / sizeof(ULONG)], index % (8 * sizeof(ULONG)));
 }
 
 void bitmap_set(ULONG *bitmap, ULONGLONG index, BOOL val)
 {
+	// if (val)
+	// 	bitmap[index / 8 / sizeof(ULONG)] |= (1ul << (index % (8 * sizeof(ULONG))));
+	// else
+	// 	bitmap[index / 8 / sizeof(ULONG)] &= ~(1ul << (index % (8 * sizeof(ULONG))));
 	if (val)
-		bitmap[index / 8 / sizeof(ULONG)] |= (1ul << (index % (8 * sizeof(ULONG))));
+		_bittestandset((LONG*)&bitmap[index / 8 / sizeof(ULONG)], index % (8 * sizeof(ULONG)));
 	else
-		bitmap[index / 8 / sizeof(ULONG)] &= ~(1ul << (index % (8 * sizeof(ULONG))));
+		_bittestandreset((LONG*)&bitmap[index / 8 / sizeof(ULONG)], index % (8 * sizeof(ULONG)));
 }
 
 NTSTATUS RtlAllocateUnicodeString(PUNICODE_STRING us, ULONG maxLength)
@@ -893,6 +898,52 @@ NTSTATUS FastFsdRequest(
 	return status;
 }
 
+PDEVICE_OBJECT GetVolumeDeviceByFileHandle(HANDLE fileHandle)
+{
+	NTSTATUS status;
+	PFILE_OBJECT	fileObject = NULL;
+	PDEVICE_OBJECT volumeDevice = NULL;
+
+	status = ObReferenceObjectByHandle(fileHandle, 0, NULL, KernelMode, (PVOID*)&fileObject, NULL);
+
+	if (!NT_SUCCESS(status))
+		return NULL;
+
+	if (fileObject->DeviceObject->DeviceType != FILE_DEVICE_NETWORK_FILE_SYSTEM)
+		volumeDevice = fileObject->DeviceObject;
+	
+	ObDereferenceObject(fileObject);
+	return volumeDevice;
+}
+
+PDEVICE_OBJECT GetVolumeDeviceByFileName(PUNICODE_STRING fileName)
+{
+	NTSTATUS status;
+	HANDLE	fileHandle = NULL;
+	PFILE_OBJECT	fileObject = NULL;
+	PDEVICE_OBJECT volumeDevice = NULL;
+
+	status = GetFileHandleReadOnly(&fileHandle, fileName);
+
+	if (!NT_SUCCESS(status))
+		return NULL;
+
+	status = ObReferenceObjectByHandle(fileHandle, 0, NULL, KernelMode, (PVOID*)&fileObject, NULL);
+
+	if (!NT_SUCCESS(status))
+	{
+		ZwClose(fileHandle);
+		return NULL;
+	}
+
+	if (fileObject->DeviceObject->DeviceType != FILE_DEVICE_NETWORK_FILE_SYSTEM)
+		volumeDevice = fileObject->DeviceObject;
+
+	ObDereferenceObject(fileObject);
+	ZwClose(fileHandle);
+	return volumeDevice;
+}
+
 void LogErrorMessage(
 	IN PDEVICE_OBJECT DeviceObject,
 	IN NTSTATUS ErrorCode)
@@ -1377,6 +1428,14 @@ void FormatFAT32FileSystem(HANDLE hFile, ULONGLONG FileSize, CHAR VolumeLabel[11
 	Offset.QuadPart = 1 * 512ull;
 	ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
 	LogInfo("Write FSInfo sector ok\n");
+
+	memset(sectorBuf, 0x00, 0x200);
+	for (UINT scl = 2; scl <= ssa + bpb.SectorsPerCluster; scl++)
+	{
+		//write_sector(sectorBuf, scl);
+		Offset.QuadPart = scl * 512ull;
+		ZwWriteFile(hFile, NULL, NULL, NULL, &IoStatus, sectorBuf, 512, &Offset, NULL);
+	}
 
 	// write backup copy of metadata
 	//write_sector(sectorBuf0, 6);

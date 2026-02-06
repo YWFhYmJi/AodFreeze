@@ -130,7 +130,7 @@
 #endif
 
 #undef SIZE_T
-#ifdef AMD64
+#if defined(AMD64) || defined(ARM64)
 #define SIZE_T unsigned long long
 #define SIZEOF_SIZE_T 8
 #else
