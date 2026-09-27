@@ -190,3 +190,11 @@ SymbolicName=MSG_CANCEL_SAVEDATA_OK
 Language=English
 The data on volume %2 will not be saved on shutdown.
 .
+
+MessageId=0x0017
+Facility=Driver
+Severity=Informational
+SymbolicName=MSG_EXIT_PROTECT
+Language=English
+Volume %2 has successfully exited protected mode.
+.

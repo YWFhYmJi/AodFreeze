@@ -189,20 +189,20 @@ public:
 		return dest.u;
 	}
 
-	static BOOL IsServiceRunning(WCHAR * serviceName)
+	static BOOL IsServiceRunning(LPCWSTR serviceName)
 	{
 		BOOL		ret = FALSE;
 		SC_HANDLE   scmHandle = NULL;
 		SC_HANDLE   serviceHandle = NULL;
 
-		scmHandle = OpenSCManager(NULL, NULL, GENERIC_READ);
+		scmHandle = OpenSCManagerW(NULL, NULL, GENERIC_READ);
 
 		if (NULL == scmHandle)
 		{
 			return ret;
 		}
 
-		serviceHandle = OpenService(scmHandle, serviceName, GENERIC_READ);
+		serviceHandle = OpenServiceW(scmHandle, serviceName, GENERIC_READ);
 
 		if (NULL != serviceHandle)
 		{
@@ -361,9 +361,10 @@ public:
 
 	static BOOL Wow64FsRedirection(BOOL Enable = FALSE)
 	{
+#if defined(_WIN64) || defined(_ARM64_)
+		return TRUE;
+#else
 		static PVOID pOldVal = NULL;
-		if (Is64BitOS())
-			return TRUE;
 		if (!Enable)
 		{
 			BOOL bRet = SafeWow64DisableWow64FsRedirection(&pOldVal);
@@ -374,9 +375,10 @@ public:
 		else if (pOldVal != NULL)
 			return SafeWow64RevertWow64FsRedirection(pOldVal);
 		return FALSE;
+#endif
 	}
 
-	static BOOL EnableDebugPrivilege(TCHAR* PName, BOOL bEnable)
+	static BOOL EnableDebugPrivilege(LPCTSTR PName, BOOL bEnable)
 	{
 		BOOL              result = TRUE;
 		HANDLE            token;
@@ -1027,6 +1029,11 @@ public:
 		WCHAR sysDirPath[MAX_PATH];
 		WCHAR targetPath[MAX_PATH];
 		WCHAR regPath[MAX_PATH];
+		LSTATUS result;
+		WCHAR buff[1024];
+		DWORD retLen = sizeof(buff);
+		ULONG type = REG_MULTI_SZ;
+		BOOL success = TRUE;
 
 		if (!serviceName || !configPath || !GetSystemDirectoryW(sysDirPath, sizeof(sysDirPath)))
 			return FALSE;
@@ -1052,7 +1059,6 @@ public:
 		swprintf_s(regPath, L"SYSTEM\\CurrentControlSet\\Services\\%s", serviceName);
 		if (!DiskfltHelper::CreateRegKey(HKEY_LOCAL_MACHINE, regPath, &regKey))
 			goto failed;
-		BOOL success = TRUE;
 		success = success && DiskfltHelper::SetRegDword(regKey, NULL, L"Type", SERVICE_KERNEL_DRIVER);
 		success = success && DiskfltHelper::SetRegDword(regKey, NULL, L"Start", SERVICE_BOOT_START);
 		success = success && DiskfltHelper::SetRegString(regKey, NULL, L"Group", L"Boot Bus Extender");
@@ -1077,14 +1083,10 @@ public:
 		if (!DiskfltHelper::CreateRegKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E967-E325-11CE-BFC1-08002BE10318}", &regKey))
 			goto failed;
 
-		WCHAR buff[1024];
-		DWORD retLen = sizeof(buff);
-		ULONG type = REG_MULTI_SZ;
-
 		memset(buff, 0, sizeof(buff));
 		success = FALSE;
 
-		LSTATUS result = RegQueryValueExW(regKey, L"UpperFilters", 0, &type, (LPBYTE)buff, &retLen);
+		result = RegQueryValueExW(regKey, L"UpperFilters", 0, &type, (LPBYTE)buff, &retLen);
 
 		if (ERROR_SUCCESS == result && type == REG_MULTI_SZ)
 		{
@@ -1484,6 +1486,7 @@ public:
 		LARGE_INTEGER FileSize;
 		PUCHAR Buffer = NULL;
 		BOOL bRet = FALSE;
+		LONGLONG lSize;
 
 		FileHandle = CreateFile(lpFileName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 		if (FileHandle == INVALID_HANDLE_VALUE)
@@ -1492,7 +1495,7 @@ public:
 		if (!GetFileSizeEx(FileHandle, &FileSize))
 			goto out;
 
-		LONGLONG lSize = FileSize.QuadPart;
+		lSize = FileSize.QuadPart;
 		Buffer = (PUCHAR)malloc(DISKFILTER_HASH_BUFFER_SIZE + 40);
 		if (!Buffer)
 			goto out;

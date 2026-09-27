@@ -240,3 +240,12 @@
 //
 #define MSG_CANCEL_SAVEDATA_OK           ((NTSTATUS)0x40070016L)
 
+//
+// MessageId: MSG_EXIT_PROTECT
+//
+// MessageText:
+//
+// Volume %2 has successfully exited protected mode.
+//
+#define MSG_EXIT_PROTECT                 ((NTSTATUS)0x40070017L)
+

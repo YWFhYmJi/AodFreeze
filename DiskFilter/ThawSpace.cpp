@@ -3,6 +3,7 @@
 #include <ntstrsafe.h>
 #include <wdmsec.h>
 #include <mountmgr.h>
+#include <mountdev.h>
 #include <ntddvol.h>
 #include <ntddscsi.h>
 #include "Utils.h"
@@ -20,6 +21,7 @@ typedef struct _DEVICE_EXTENSION {
 	BOOLEAN                     media_in_device;
 	UNICODE_STRING              device_name;
 	ULONG                       device_number;
+	GUID						unique_id;
 	HANDLE                      file_handle;
 	UNICODE_STRING              file_name;
 	LARGE_INTEGER               file_size;
@@ -143,6 +145,7 @@ ThawSpaceCreateDevice(
 	device_extension->device_name.MaximumLength = device_name.MaximumLength;
 	device_extension->device_name.Buffer = device_name.Buffer;
 	device_extension->device_number = Number;
+	CreateUuid(&device_extension->unique_id);
 
 	InitializeListHead(&device_extension->list_head);
 
@@ -705,7 +708,7 @@ ThawSpaceDeviceControl(
 		}
 
 		name = (PMOUNTDEV_NAME)Irp->AssociatedIrp.SystemBuffer;
-		name->NameLength = device_extension->device_name.Length * sizeof(WCHAR);
+		name->NameLength = device_extension->device_name.Length;
 
 		if (io_stack->Parameters.DeviceIoControl.OutputBufferLength <
 			name->NameLength + sizeof(USHORT))
@@ -719,6 +722,36 @@ ThawSpaceDeviceControl(
 
 		status = STATUS_SUCCESS;
 		Irp->IoStatus.Information = name->NameLength + sizeof(USHORT);
+
+		break;
+	}
+
+	case IOCTL_MOUNTDEV_QUERY_UNIQUE_ID:
+	{
+		PMOUNTDEV_UNIQUE_ID uuid;
+		if (io_stack->Parameters.DeviceIoControl.OutputBufferLength < 
+			sizeof(MOUNTDEV_UNIQUE_ID))
+		{
+			status = STATUS_INVALID_PARAMETER;
+			Irp->IoStatus.Information = 0;
+			break;
+		}
+
+		uuid = (PMOUNTDEV_UNIQUE_ID)Irp->AssociatedIrp.SystemBuffer;
+		uuid->UniqueIdLength = sizeof(device_extension->unique_id);
+
+		if (io_stack->Parameters.DeviceIoControl.OutputBufferLength <
+			uuid->UniqueIdLength + sizeof(USHORT))
+		{
+			status = STATUS_BUFFER_OVERFLOW;
+			Irp->IoStatus.Information = sizeof(MOUNTDEV_NAME);
+			break;
+		}
+
+		RtlCopyMemory(uuid->UniqueId, &device_extension->unique_id, uuid->UniqueIdLength);
+
+		status = STATUS_SUCCESS;
+		Irp->IoStatus.Information = uuid->UniqueIdLength + sizeof(USHORT);
 
 		break;
 	}
@@ -1029,6 +1062,42 @@ ThawSpaceOpenFile(
 	LogInfo("ThawSpace: File %wZ mount on %c: ok.\n", &device_extension->file_name, device_extension->drive_letter);
 
 	return STATUS_SUCCESS;
+}
+
+HANDLE ThawSpaceGetFileHandle(
+	IN PDEVICE_OBJECT            DeviceObject
+)
+{
+	PDEVICE_EXTENSION device_extension;
+
+	ASSERT(DeviceObject != NULL);
+
+	device_extension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+
+	if (device_extension->media_in_device)
+	{
+		return device_extension->file_handle;
+	}
+
+	return NULL;
+}
+
+WCHAR ThawSpaceGetDriveLetter(
+	IN PDEVICE_OBJECT            DeviceObject
+)
+{
+	PDEVICE_EXTENSION device_extension;
+
+	ASSERT(DeviceObject != NULL);
+
+	device_extension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+
+	if (device_extension->media_in_device)
+	{
+		return device_extension->drive_letter;
+	}
+
+	return NULL;
 }
 
 NTSTATUS

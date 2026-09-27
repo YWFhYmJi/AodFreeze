@@ -53,6 +53,14 @@ ThawSpaceOpenFile(
 	IN POPEN_FILE_INFORMATION    open_file_information
 );
 
+HANDLE ThawSpaceGetFileHandle(
+	IN PDEVICE_OBJECT            DeviceObject
+);
+
+WCHAR ThawSpaceGetDriveLetter(
+	IN PDEVICE_OBJECT            DeviceObject
+);
+
 NTSTATUS
 ThawSpaceCloseFile(
 	IN PDEVICE_OBJECT DeviceObject

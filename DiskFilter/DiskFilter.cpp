@@ -12,6 +12,7 @@
 #include "messages.h"
 #include "ThawSpace.h"
 #include "DirectDisk.h"
+#include <intrin.h>
 
 // 保护硬盘特定扇区所用到的信息
 typedef struct _DISK_INFO
@@ -24,7 +25,7 @@ typedef struct _DISK_INFO
 // 保护配置文件路径、文件对象、所在盘符、所在扇区
 UNICODE_STRING ConfigPath;
 PFILE_OBJECT ConfigFileObject;
-VOLUME_INFO ConfigVolume;
+WCHAR ConfigVolumeLetter;
 PRETRIEVAL_POINTERS_BUFFER ConfigVcnPairs;
 
 // 不使用Inbv显示信息，兼容一些显卡驱动
@@ -46,6 +47,12 @@ UINT DirectDiskCount; // 已挂载的直接读写卷数量
 
 // 读写操作线程
 void ThreadReadWrite(PVOID Context);
+
+// 获取保护状态
+static FORCEINLINE UCHAR GetProtectStatus(PVOLUME_INFO v)
+{
+	return (UCHAR)_InterlockedCompareExchange8((volatile CHAR*)&v->ProtectStatus, 0, 0);
+}
 
 // 检查配置文件是否有效
 BOOLEAN IsValidConfig(PDISKFILTER_PROTECTION_CONFIG Conf)
@@ -100,12 +107,12 @@ NTSTATUS GetVolumeInfo(ULONG DiskNum, DWORD PartitionNum, PVOLUME_INFO info)
 		NULL);
 
 	status = ZwCreateFile(&fileHandle,
-		GENERIC_ALL | SYNCHRONIZE,
+		GENERIC_READ | SYNCHRONIZE,
 		&oa,
 		&IoStatusBlock,
 		NULL,
 		0,
-		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 		FILE_OPEN,
 		FILE_SYNCHRONOUS_IO_NONALERT,	// 同步读写
 		NULL,
@@ -140,15 +147,15 @@ NTSTATUS GetVolumeInfo(ULONG DiskNum, DWORD PartitionNum, PVOLUME_INFO info)
 
 			if (partitionInfo.PartitionStyle == PARTITION_STYLE_MBR)
 			{
-				info->PartitionType = partitionInfo.Mbr.PartitionType;
+				UCHAR PartitionType = partitionInfo.Mbr.PartitionType;
 
 				// FAT分区，获取LBR, 得到第一个簇的偏移
-				if ((PARTITION_FAT_12 == info->PartitionType) ||
-					(PARTITION_FAT_16 == info->PartitionType) ||
-					(PARTITION_HUGE == info->PartitionType) ||
-					(PARTITION_FAT32 == info->PartitionType) ||
-					(PARTITION_FAT32_XINT13 == info->PartitionType) ||
-					(PARTITION_XINT13 == info->PartitionType))
+				if ((PARTITION_FAT_12 == PartitionType) ||
+					(PARTITION_FAT_16 == PartitionType) ||
+					(PARTITION_HUGE == PartitionType) ||
+					(PARTITION_FAT32 == PartitionType) ||
+					(PARTITION_FAT32_XINT13 == PartitionType) ||
+					(PARTITION_XINT13 == PartitionType))
 				{
 					status = GetFatFirstSectorOffset(fileHandle, &info->FirstDataSector);
 				}
@@ -157,7 +164,6 @@ NTSTATUS GetVolumeInfo(ULONG DiskNum, DWORD PartitionNum, PVOLUME_INFO info)
 			{
 				// 不知道分区是否是FAT类型的，尝试获取第一个簇的偏移
 				GetFatFirstSectorOffset(fileHandle, &info->FirstDataSector);
-				info->PartitionType = PARTITION_IFS;
 			}
 		}
 		else
@@ -232,26 +238,7 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigFilePath, PDISKFILTER_PROTEC
 				// 得到类似C:这样的盘符，为了获取VolumeInfo
 				if (NT_SUCCESS(IoVolumeDeviceToDosName(ConfigFile->DeviceObject, &uniDosName)) && uniDosName.Buffer)
 				{
-					WCHAR ConfigVolumeLetter = towupper(*(WCHAR *)uniDosName.Buffer);
-					ULONG ConfigDiskNum, ConfigPartNum;
-					if (NT_SUCCESS(GetPartNumFromVolLetter(ConfigVolumeLetter, &ConfigDiskNum, &ConfigPartNum)))
-					{
-						LogInfo("Config volume %c -> (%lu,%lu)\n", ConfigVolumeLetter, ConfigDiskNum, ConfigPartNum);
-						if (NT_SUCCESS(GetVolumeInfo(ConfigDiskNum, ConfigPartNum, &ConfigVolume)))
-						{
-							ConfigVolume.Volume = ConfigVolumeLetter;
-						}
-						else
-						{
-							LogWarn("Failed to get config volume info\n");
-							ConfigVolume.Volume = 0; // 获取失败，标记为无效
-						}
-					}
-					else
-					{
-						LogWarn("Failed to read partition number for config volume %c\n", ConfigVolume.Volume);
-					}
-
+					ConfigVolumeLetter = towupper(*(WCHAR *)uniDosName.Buffer);
 					ExFreePool(uniDosName.Buffer);
 				}
 				ObDereferenceObject(ConfigFile);
@@ -283,13 +270,26 @@ NTSTATUS ReadProtectionConfig(PUNICODE_STRING ConfigFilePath, PDISKFILTER_PROTEC
 	return STATUS_SUCCESS;
 }
 
-// 写入保护配置
+// 写入保护配置（通过IRP操作文件读写）
+NTSTATUS WriteProtectionConfigIrp(PDISKFILTER_PROTECTION_CONFIG ConfigData)
+{
+	IO_STATUS_BLOCK IoStatus = { 0 };
+	LARGE_INTEGER ByteOffset = { 0 };
+	ByteOffset.QuadPart = 0;
+	return IrpWriteFile(ConfigFileObject, &IoStatus, ConfigData, sizeof(DISKFILTER_PROTECTION_CONFIG), &ByteOffset);
+}
+
+// 写入保护配置（通过直接写入文件扇区）
 NTSTATUS WriteProtectionConfig(PDISKFILTER_PROTECTION_CONFIG ConfigData)
 {
-	if (ConfigVolume.Volume == 0 || ConfigVolume.DiskNumber >= sizeof(LowerDeviceObject) / sizeof(*LowerDeviceObject) || !ConfigVcnPairs || ConfigVcnPairs->Extents[0].Lcn.QuadPart == -1) // 配置文件不支持压缩
+	if (ConfigVolumeLetter < L'A' || ConfigVolumeLetter > L'Z')
 		return STATUS_UNSUCCESSFUL;
 
-	ULONG sectorsPerCluster = ConfigVolume.BytesPerCluster / ConfigVolume.BytesPerSector;
+	PVOLUME_INFO ConfigVolume = VolumeList[ConfigVolumeLetter - L'A'];
+	if (!ConfigVolume || ConfigVolume->ProtectStatus != 3 || !ConfigVcnPairs)
+		return WriteProtectionConfigIrp(ConfigData);
+
+	ULONG sectorsPerCluster = ConfigVolume->BytesPerCluster / ConfigVolume->BytesPerSector;
 	NTSTATUS status = STATUS_SUCCESS;
 
 	ULONG	Cls, r;
@@ -304,14 +304,14 @@ NTSTATUS WriteProtectionConfig(PDISKFILTER_PROTECTION_CONFIG ConfigData)
 			CnCount; CnCount--, Cls++, Lcn.QuadPart++)
 		{
 			ULONGLONG	i = 0;
-			ULONGLONG	base = ConfigVolume.FirstDataSector + (Lcn.QuadPart * sectorsPerCluster);
+			ULONGLONG	base = ConfigVolume->FirstDataSector + (Lcn.QuadPart * sectorsPerCluster);
 			for (i = 0; i < sectorsPerCluster; i++)
 			{
-				ULONG CurOffset = SectorOffset * ConfigVolume.BytesPerSector;
+				ULONG CurOffset = SectorOffset * ConfigVolume->BytesPerSector;
 				if (CurOffset > sizeof(DISKFILTER_PROTECTION_CONFIG))
 					continue;
-				ULONGLONG DiskOffset = ConfigVolume.StartOffset + (base + i) * ConfigVolume.BytesPerSector;
-				status = FastFsdRequest(LowerDeviceObject[ConfigVolume.DiskNumber], IRP_MJ_WRITE, DiskOffset, (PUCHAR)ConfigData + CurOffset, min(ConfigVolume.BytesPerSector, sizeof(DISKFILTER_PROTECTION_CONFIG) - CurOffset), TRUE);
+				ULONGLONG DiskOffset = ConfigVolume->StartOffset + (base + i) * ConfigVolume->BytesPerSector;
+				status = FastFsdRequest(LowerDeviceObject[ConfigVolume->DiskNumber], IRP_MJ_WRITE, DiskOffset, (PUCHAR)ConfigData + CurOffset, min(ConfigVolume->BytesPerSector, sizeof(DISKFILTER_PROTECTION_CONFIG) - CurOffset), TRUE);
 				if (!NT_SUCCESS(status))
 					return status;
 				SectorOffset++;
@@ -322,145 +322,20 @@ NTSTATUS WriteProtectionConfig(PDISKFILTER_PROTECTION_CONFIG ConfigData)
 	return status;
 }
 
-// 初始化卷的位图信息
-NTSTATUS InitVolumeLogicBitmap(PVOLUME_INFO volumeInfo)
-{
-	NTSTATUS status;
-	PVOLUME_BITMAP_BUFFER Bitmap = NULL;
-
-	// 逻辑位图大小
-	ULONGLONG logicBitMapMaxSize = 0;
-
-	ULONG SectorsPerCluster = 0;
-
-	ULONGLONG i = 0;
-
-	SectorsPerCluster = volumeInfo->BytesPerCluster / volumeInfo->BytesPerSector;
-
-	// 获取此卷上有多少个扇区, 用bytesTotal这个比较准确，如果用其它的比如fsinfo,会少几个扇区发现
-	volumeInfo->SectorCount = volumeInfo->BytesTotal / volumeInfo->BytesPerSector;
-
-	// 得到逻辑位图的大小bytes
-	logicBitMapMaxSize = (volumeInfo->SectorCount / 8) + 1;
-
-	// 上次扫描的空闲簇的位置
-	volumeInfo->LastScanIndex = 0;
-
-	// 以扇区为单位的位图
-	if (!NT_SUCCESS(DPBitmap_Create(&volumeInfo->BitmapRedirect, volumeInfo->SectorCount, BITMAP_SLOT_SIZE)))
-	{
-		status = STATUS_UNSUCCESSFUL;
-		goto out;
-	}
-
-	// 以扇区为单位的位图
-	if (!NT_SUCCESS(DPBitmap_Create(&volumeInfo->BitmapRedirectUsed, volumeInfo->SectorCount, BITMAP_SLOT_SIZE)))
-	{
-		status = STATUS_UNSUCCESSFUL;
-		goto out;
-	}
-
-	// 以扇区为单位的位图
-	if (!NT_SUCCESS(DPBitmap_Create(&volumeInfo->BitmapAllow, volumeInfo->SectorCount, BITMAP_SLOT_SIZE)))
-	{
-		status = STATUS_UNSUCCESSFUL;
-		goto out;
-	}
-
-	// 以扇区为单位的位图, 如果一次申请内存过大，会失败，用dpbitmap申请不连续的内存
-	if (!NT_SUCCESS(DPBitmap_Create(&volumeInfo->BitmapUsed, volumeInfo->SectorCount, BITMAP_SLOT_SIZE)))
-	{
-		status = STATUS_UNSUCCESSFUL;
-		goto out;
-	}
-
-	// 正式簇开始前的簇都标记为已使用
-	for (i = 0; i < volumeInfo->FirstDataSector; i++)
-	{
-		DPBitmap_Set(volumeInfo->BitmapUsed, i, TRUE);
-	}
-
-	// 获取位图
-	status = GetVolumeBitmapInfo(volumeInfo->DiskNumber, volumeInfo->PartitionNumber, &Bitmap);
-
-	if (!NT_SUCCESS(status))
-	{
-		goto out;
-	}
-
-	// 初始化位图
-	for (i = 0; i < (ULONGLONG)Bitmap->BitmapSize.QuadPart; i++)
-	{
-		if (bitmap_test((PULONG)Bitmap->Buffer, i))
-		{
-			ULONGLONG j = 0;
-			ULONGLONG base = volumeInfo->FirstDataSector + (i * SectorsPerCluster);
-			for (j = 0; j < SectorsPerCluster; j++)
-			{
-				status = DPBitmap_Set(volumeInfo->BitmapUsed, base + j, TRUE);
-				if (!NT_SUCCESS(status))
-				{
-					goto out;
-				}
-			}
-		}
-	}
-
-	// 初始化重定向列表
-	RedirectTable_Init(&volumeInfo->RedirectMap);
-
-	if (AllowDirectMount)
-	{
-		// 初始化反向重定向列表
-		RedirectTable_Init(&volumeInfo->ReverseRedirectMap);
-	}
-
-	status = STATUS_SUCCESS;
-
-out:
-
-	if (!NT_SUCCESS(status))
-	{
-		DPBitmap_Free(volumeInfo->BitmapRedirect);
-		volumeInfo->BitmapRedirect = NULL;
-		DPBitmap_Free(volumeInfo->BitmapRedirectUsed);
-		volumeInfo->BitmapRedirectUsed = NULL;
-		DPBitmap_Free(volumeInfo->BitmapAllow);
-		volumeInfo->BitmapAllow = NULL;
-		DPBitmap_Free(volumeInfo->BitmapUsed);
-		volumeInfo->BitmapUsed = NULL;
-	}
-	if (Bitmap)
-		__free(Bitmap);
-
-	return status;
-}
-
-// 设置文件数据直接读写
-NTSTATUS SetDirectReadWriteFile(PVOLUME_INFO volume, PWCHAR path)
+// 通过文件句柄设置文件数据直接读写
+NTSTATUS SetDirectReadWriteFileHandle(PVOLUME_INFO volume, HANDLE fileHandle)
 {
 	if (volume == NULL)
 		return STATUS_UNSUCCESSFUL;
 
-	WCHAR tempBuffer[MAX_PATH];
-	swprintf_s(tempBuffer, MAX_PATH, L"\\Device\\Harddisk%d\\Partition%d%ls", volume->DiskNumber, volume->PartitionNumber, path);
-	UNICODE_STRING target;
-	RtlInitUnicodeString(&target, tempBuffer);
-	HANDLE fileHandle = (HANDLE)-1;
-	NTSTATUS status = GetFileHandleReadOnly(&fileHandle, &target);
-	if (!NT_SUCCESS(status))
-	{
-		goto out;
-	}
-
+	NTSTATUS status = STATUS_SUCCESS;
 	ULONG sectorsPerCluster = volume->BytesPerCluster / volume->BytesPerSector;
 
 	PRETRIEVAL_POINTERS_BUFFER pVcnPairs = (PRETRIEVAL_POINTERS_BUFFER)GetFileClusterList(fileHandle);
 
 	if (!pVcnPairs || pVcnPairs->Extents[0].Lcn.QuadPart == -1) // 不支持被压缩的文件
 	{
-		LogInfo("Failed to get file cluster list, file compressed?\n");
-		status = STATUS_UNSUCCESSFUL;
+		LogWarn("Failed to get file cluster list, file compressed?\n");
 		goto out;
 	}
 
@@ -490,6 +365,42 @@ NTSTATUS SetDirectReadWriteFile(PVOLUME_INFO volume, PWCHAR path)
 	__free(pVcnPairs);
 
 out:
+	if (!NT_SUCCESS(status))
+	{
+		LogWarn("Failed to set direct read/write for file handle (%d,%d):%p. Status=0x%.8X\n", volume->DiskNumber, volume->PartitionNumber, (void *)fileHandle, status);
+	}
+	else
+	{
+		LogInfo("Successfully set direct read/write for file handle (%d,%d):%p.\n", volume->DiskNumber, volume->PartitionNumber, (void *)fileHandle);
+	}
+	return status;
+}
+
+// 设置文件数据直接读写
+NTSTATUS SetDirectReadWriteFile(PVOLUME_INFO volume, PWCHAR path)
+{
+	if (volume == NULL)
+		return STATUS_UNSUCCESSFUL;
+
+	WCHAR tempBuffer[MAX_PATH];
+	swprintf_s(tempBuffer, MAX_PATH, L"\\Device\\Harddisk%d\\Partition%d%ls", volume->DiskNumber, volume->PartitionNumber, path);
+	UNICODE_STRING target;
+	RtlInitUnicodeString(&target, tempBuffer);
+	HANDLE fileHandle = (HANDLE)-1;
+	NTSTATUS status = GetFileHandleReadOnly(&fileHandle, &target);
+	if (!NT_SUCCESS(status))
+	{
+		LogInfo("Retry opening %ls with backup intent\n", path);
+		status = GetFileHandleReadOnlyBackup(&fileHandle, &target);
+	}
+	if (!NT_SUCCESS(status))
+	{
+		goto out;
+	}
+
+	status = SetDirectReadWriteFileHandle(volume, fileHandle);
+
+out:
 	if ((HANDLE)-1 != fileHandle)
 		ZwClose(fileHandle);
 
@@ -502,6 +413,27 @@ out:
 		LogInfo("Successfully set direct read/write for file (%d,%d):%ls.\n", volume->DiskNumber, volume->PartitionNumber, path);
 	}
 	return status;
+}
+
+// 通过盘符获取解冻空间设备对象
+PDEVICE_OBJECT FindThawSpaceDeviceByVolumeLetter(WCHAR VolumeLetter)
+{
+	PDRIVER_OBJECT DriverObject = FilterDevice->DriverObject;
+	PDEVICE_OBJECT CurDevice = DriverObject->DeviceObject;
+	while (TRUE)
+	{
+		while (CurDevice != NULL && !IsThawSpaceDevice(CurDevice))
+			CurDevice = CurDevice->NextDevice;
+
+		if (CurDevice == NULL)
+			break;
+
+		if (ThawSpaceGetDriveLetter(CurDevice) == VolumeLetter)
+			return CurDevice;
+
+		CurDevice = CurDevice->NextDevice;
+	}
+	return NULL;
 }
 
 // 初始化卷的直接读写列表
@@ -523,9 +455,21 @@ void InitVolumeAllowList(PVOLUME_INFO volumeInfo)
 	{
 		for (UCHAR i = 0; i < Config.ThawSpaceCount; i++)
 		{
-			if (!(Config.ThawSpacePath[i][MAX_PATH] & DISKFILTER_THAWSPACE_HIDE) && toupper(Config.ThawSpacePath[i][0]) == volumeInfo->Volume)
+			WCHAR TCfg = Config.ThawSpacePath[i][MAX_PATH];
+			if (!(TCfg & DISKFILTER_THAWSPACE_HIDE) && toupper(Config.ThawSpacePath[i][0]) == volumeInfo->Volume)
 			{
-				if (!NT_SUCCESS(SetDirectReadWriteFile(volumeInfo, Config.ThawSpacePath[i] + 2)))
+				NTSTATUS status = SetDirectReadWriteFile(volumeInfo, Config.ThawSpacePath[i] + 2);
+				if (!NT_SUCCESS(status))
+				{
+					// 设置失败，尝试获取已有ThawSpace的文件句柄
+					PDEVICE_OBJECT ThawSpaceDevice = FindThawSpaceDeviceByVolumeLetter(TCfg);
+					if (ThawSpaceDevice)
+					{
+						HANDLE FileHandle = ThawSpaceGetFileHandle(ThawSpaceDevice);
+						status = SetDirectReadWriteFileHandle(volumeInfo, FileHandle);
+					}
+				}
+				if (!NT_SUCCESS(status))
 				{
 					LogErrorMessageWithString(FilterDevice, MSG_THAWSPACE_LOAD_FAILED, Config.ThawSpacePath[i], (ULONG)wcslen(Config.ThawSpacePath[i]));
 				}
@@ -534,13 +478,117 @@ void InitVolumeAllowList(PVOLUME_INFO volumeInfo)
 	}
 }
 
+// 初始化卷的位图信息
+NTSTATUS InitVolumeLogicBitmap(PVOLUME_INFO volumeInfo)
+{
+	NTSTATUS status;
+	PVOLUME_BITMAP_BUFFER Bitmap = NULL;
+
+	// 逻辑位图大小
+	ULONGLONG logicBitMapMaxSize = 0;
+
+	ULONG SectorsPerCluster = 0;
+
+	ULONGLONG i = 0;
+
+	SectorsPerCluster = volumeInfo->BytesPerCluster / volumeInfo->BytesPerSector;
+
+	// 获取此卷上有多少个扇区, 用bytesTotal这个比较准确，如果用其它的比如fsinfo,会少几个扇区发现
+	volumeInfo->SectorCount = volumeInfo->BytesTotal / volumeInfo->BytesPerSector;
+
+	// 得到逻辑位图的大小bytes
+	logicBitMapMaxSize = (volumeInfo->SectorCount / 8) + 1;
+
+	// 上次扫描的空闲簇的位置
+	volumeInfo->LastScanIndex = volumeInfo->FirstDataSector;
+
+	// 以扇区为单位的位图
+	status = DPBitmap_Create(&volumeInfo->BitmapRedirect, volumeInfo->SectorCount, BITMAP_SLOT_SIZE);
+	if (!NT_SUCCESS(status))
+		goto out;
+
+	// 以扇区为单位的位图
+	status = DPBitmap_Create(&volumeInfo->BitmapRedirectUsed, volumeInfo->SectorCount, BITMAP_SLOT_SIZE);
+	if (!NT_SUCCESS(status))
+		goto out;
+
+	// 以扇区为单位的位图
+	status = DPBitmap_Create(&volumeInfo->BitmapAllow, volumeInfo->SectorCount, BITMAP_SLOT_SIZE);
+	if (!NT_SUCCESS(status))
+		goto out;
+
+	// 以扇区为单位的位图, 如果一次申请内存过大，会失败，用dpbitmap申请不连续的内存
+	status = DPBitmap_Create(&volumeInfo->BitmapUsed, volumeInfo->SectorCount, BITMAP_SLOT_SIZE);
+	if (!NT_SUCCESS(status))
+		goto out;
+
+	// 正式簇开始前的簇都标记为已使用
+	status = DPBitmap_SetRange(volumeInfo->BitmapUsed, 0, volumeInfo->FirstDataSector, TRUE);
+	if (!NT_SUCCESS(status))
+		goto out;
+
+	InterlockedExchange8((PCHAR)&volumeInfo->ProtectStatus, 1);
+	// 获取位图
+	status = GetVolumeBitmapInfo(volumeInfo->DiskNumber, volumeInfo->PartitionNumber, &Bitmap);
+	if (!NT_SUCCESS(status))
+		goto out;
+
+	InterlockedExchange8((PCHAR)&volumeInfo->ProtectStatus, 2);
+	// 初始化位图
+	for (i = 0; i < (ULONGLONG)Bitmap->BitmapSize.QuadPart; i++)
+	{
+		if (bitmap_test((PULONG)Bitmap->Buffer, i))
+		{
+			status = DPBitmap_SetRange(volumeInfo->BitmapUsed, volumeInfo->FirstDataSector + (i * SectorsPerCluster), SectorsPerCluster, TRUE);
+			if (!NT_SUCCESS(status))
+				goto out;
+		}
+	}
+
+	// 初始化重定向列表
+	RedirectTable_Init(&volumeInfo->RedirectMap);
+
+	if (AllowDirectMount)
+	{
+		// 初始化反向重定向列表
+		RedirectTable_Init(&volumeInfo->ReverseRedirectMap);
+	}
+
+	// 初始化直接读写列表
+	InitVolumeAllowList(volumeInfo);
+
+	status = STATUS_SUCCESS;
+
+out:
+
+	if (!NT_SUCCESS(status))
+	{
+		DPBitmap_Free(volumeInfo->BitmapRedirect);
+		volumeInfo->BitmapRedirect = NULL;
+		DPBitmap_Free(volumeInfo->BitmapRedirectUsed);
+		volumeInfo->BitmapRedirectUsed = NULL;
+		DPBitmap_Free(volumeInfo->BitmapAllow);
+		volumeInfo->BitmapAllow = NULL;
+		DPBitmap_Free(volumeInfo->BitmapUsed);
+		volumeInfo->BitmapUsed = NULL;
+	}
+	if (Bitmap)
+		__free(Bitmap);
+
+	return status;
+}
+
 // 根据硬盘号和分区号获取保护卷
-PVOLUME_INFO FindProtectVolume(ULONG DiskNum, DWORD PartitionNum)
+PVOLUME_INFO FindProtectVolume(ULONG DiskNum, DWORD PartitionNum, BOOLEAN CheckStatus = TRUE)
 {
 	for (UINT i = 0; i < ValidVolumeCount; i++)
 	{
 		if (ProtectVolumeList[i].DiskNumber == DiskNum && ProtectVolumeList[i].PartitionNumber == PartitionNum)
-			return &(ProtectVolumeList[i]);
+		{
+			UCHAR ProtectStatus = GetProtectStatus(&ProtectVolumeList[i]);
+			if ((ProtectStatus >= 1 && ProtectStatus <= 3) || !CheckStatus)
+				return &(ProtectVolumeList[i]);
+		}
 	}
 	return NULL;
 }
@@ -556,38 +604,114 @@ PVOLUME_INFO FindProtectVolumeByDevice(PDEVICE_OBJECT VolumeDevice)
 	return NULL;
 }
 
-// 初始化盘符（更改保护卷图标、初始化卷的允许直接读写列表）
-void InitVolumeLetter()
+// 进入保护（创建请求处理线程、获取保护卷信息、获取位图）
+NTSTATUS EnterProtectVolume(PVOLUME_INFO volumeInfo, ULONG DiskNum, ULONG PartitionNum)
 {
-	for (WCHAR i = L'C'; i <= L'Z'; i++)
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	BOOLEAN AllocVolume = FALSE;
+	if (!volumeInfo)
 	{
-		ULONG DiskNum = 0;
-		DWORD PartitionNum = 0;
-		if (NT_SUCCESS(GetPartNumFromVolLetter(i, &DiskNum, &PartitionNum)))
+		UINT Cur = ValidVolumeCount;
+		if (Cur >= sizeof(ProtectVolumeList) / sizeof(*ProtectVolumeList))
+			return STATUS_INSUFFICIENT_RESOURCES;
+		volumeInfo = &ProtectVolumeList[Cur];
+		AllocVolume = TRUE;
+	}
+	else
+	{
+		UCHAR ProtectStatus = GetProtectStatus(volumeInfo);
+		if (ProtectStatus >= 1 && ProtectStatus <= 3)
+			return STATUS_SUCCESS;
+		if (volumeInfo->Volume >= L'A' && volumeInfo->Volume <= L'Z')
+			VolumeList[volumeInfo->Volume - L'A'] = NULL;
+	}
+	FlushVolume(DiskNum, PartitionNum);
+	memset(volumeInfo, 0, sizeof(*volumeInfo));
+	status = GetVolumeInfo(DiskNum, PartitionNum, volumeInfo);
+	if (NT_SUCCESS(status))
+	{
+		LogInfo("Found valid volume on disk %hu partition %hu\n", DiskNum, PartitionNum);
+		//初始化磁盘盘符
+		volumeInfo->Volume = GetVolumeLetter(DiskNum, PartitionNum);
+		//初始化这个卷的请求处理队列
+		InitializeListHead(&volumeInfo->ListHead);
+		//初始化请求处理队列的锁
+		KeInitializeSpinLock(&volumeInfo->ListLock);
+		//初始化请求处理队列的同步事件
+		KeInitializeEvent(&volumeInfo->RequestEvent, SynchronizationEvent, FALSE);
+		//初始化终止处理线程标志
+		volumeInfo->ThreadTerminate = FALSE;
+		//初始化保存数据相关变量
+		KeInitializeEvent(&volumeInfo->FinishSaveDataEvent, SynchronizationEvent, FALSE);
+		KeInitializeEvent(&volumeInfo->FinishBitmapEvent, SynchronizationEvent, FALSE);
+		volumeInfo->CanSaveData = FALSE;
+		volumeInfo->ShutdownSaveData = FALSE;
+		volumeInfo->SavingData = FALSE;
+		InterlockedExchange8((PCHAR)&volumeInfo->ProtectStatus, 0);
+		//建立用来处理这个卷的请求的处理线程，线程函数的参数则是指向卷信息的指针
+		HANDLE ThreadHandle = NULL;
+		status = PsCreateSystemThread(
+			&ThreadHandle,
+			(ACCESS_MASK)0L,
+			NULL,
+			NULL,
+			&volumeInfo->ReadWriteThreadId,
+			ThreadReadWrite,
+			volumeInfo
+		);
+		if (NT_SUCCESS(status))
 		{
-			LogInfo("%c -> disk %lu partition %lu\n", i, DiskNum, PartitionNum);
-			PVOLUME_INFO VolInfo = FindProtectVolume(DiskNum, PartitionNum);
-			if (VolInfo)
+			if (AllocVolume)
+				InterlockedIncrement((PLONG)&ValidVolumeCount);
+			InterlockedExchange8((PCHAR)&volumeInfo->ProtectStatus, 1);
+			status = InitVolumeLogicBitmap(volumeInfo);
+			if (NT_SUCCESS(status))
 			{
-				if (VolInfo->Volume)
-				{
-					// 已经初始化过的卷就不用再初始化了
-					LogInfo("Is a initialized partition\n");
-					ChangeDriveIconProtect(i);
-					continue;
-				}
-				VolInfo->Volume = i;
-				VolumeList[i - L'A'] = VolInfo;
-				InitVolumeAllowList(VolInfo);
-				ChangeDriveIconProtect(i);
+				LogInfo("Successfully get volume logic bitmap\n");
+				// 只有在成功获取位图之后，才认为这个卷有效
+				InterlockedExchange8((PCHAR)&volumeInfo->CanSaveData, TRUE);
+				InterlockedExchange8((PCHAR)&volumeInfo->ProtectStatus, 3);
+				KeSetEvent(&volumeInfo->RequestEvent, (KPRIORITY)0, FALSE);
+				KeSetEvent(&volumeInfo->FinishBitmapEvent, (KPRIORITY)0, FALSE);
+				LogInfo("Volume (%hu,%hu) has entered protect state\n", DiskNum, PartitionNum);
 			}
 			else
 			{
-				LogInfo("Is not a protected volume\n");
+				InterlockedExchange8((PCHAR)&volumeInfo->ThreadTerminate, TRUE);
+				KeSetEvent(&volumeInfo->RequestEvent, (KPRIORITY)0, FALSE);
+				KeSetEvent(&volumeInfo->FinishBitmapEvent, (KPRIORITY)0, FALSE);
+				// 等待线程结束以防止初始化下一个卷时覆盖数据导致蓝屏
+				KeWaitForSingleObject(&volumeInfo->FinishSaveDataEvent, Executive, KernelMode, FALSE, NULL);
+				LogInfo("Failed to get volume logic bitmap\n");
 			}
+
+			if (NULL != ThreadHandle)
+				ZwClose(ThreadHandle);
+		}
+		else
+		{
+			LogInfo("Failed to create handler thread\n");
 		}
 	}
-	LogInfo("Volume letter initialization finished\n");
+	WCHAR strMsg[20] = { 0 };
+	if (NT_SUCCESS(status))
+	{
+		WCHAR VolumeLetter = volumeInfo->Volume;
+		if (VolumeLetter >= L'A' && VolumeLetter <= L'Z')
+		{
+			VolumeList[VolumeLetter - L'A'] = volumeInfo;
+			ChangeDriveIconProtect(VolumeLetter, TRUE);
+		}
+
+		swprintf_s(strMsg, 20, L"(%hu,%hu)", DiskNum, PartitionNum);
+		LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_OK, strMsg, (ULONG)wcslen(strMsg));
+	}
+	else
+	{
+		swprintf_s(strMsg, 20, L"(%hu,%hu)", DiskNum, PartitionNum);
+		LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, (ULONG)wcslen(strMsg));
+	}
+	return status;
 }
 
 // 获取硬盘信息
@@ -791,103 +915,40 @@ void InitProtectDisks()
 	}
 }
 
-// 初始化保护卷（获取保护卷信息、获取位图）
+// 初始化保护卷
 void InitProtectVolumes()
 {
-	WCHAR strMsg[512]; // 临时变量，放在此处缩小栈空间
 	for (UCHAR i = 0; i < Config.ProtectVolumeCount; i++)
 	{
 		USHORT DiskNum = DISKFILTER_DISKNUM_FROM_VOLNUM(Config.ProtectVolume[i]);
 		USHORT PartitionNum = DISKFILTER_PARTNUM_FROM_VOLNUM(Config.ProtectVolume[i]);
 		LogInfo("Protected volume: disk %hu partition %hu\n", DiskNum, PartitionNum);
 
-		PVOLUME_INFO VolInfo = FindProtectVolume(DiskNum, PartitionNum);
+		PVOLUME_INFO VolInfo = FindProtectVolume(DiskNum, PartitionNum, TRUE);
 		if (VolInfo)
 		{
 			LogInfo("Is a initialized volume\n");
 			continue;
 		}
 
-		UINT Cur = ValidVolumeCount;
-		memset(&ProtectVolumeList[Cur], 0, sizeof(ProtectVolumeList[Cur]));
-		if (NT_SUCCESS(GetVolumeInfo(DiskNum, PartitionNum, &ProtectVolumeList[Cur])))
+		if (!NT_SUCCESS(EnterProtectVolume(VolInfo, DiskNum, PartitionNum)))
 		{
-			LogInfo("Found valid volume on disk %hu partition %hu\n", DiskNum, PartitionNum);
-			//初始化这个卷的请求处理队列
-			InitializeListHead(&ProtectVolumeList[Cur].ListHead);
-			//初始化请求处理队列的锁
-			KeInitializeSpinLock(&ProtectVolumeList[Cur].ListLock);
-			//初始化请求处理队列的同步事件
-			KeInitializeEvent(
-				&ProtectVolumeList[Cur].RequestEvent,
-				SynchronizationEvent,
-				FALSE
-			);
-			//初始化终止处理线程标志
-			ProtectVolumeList[Cur].ThreadTerminate = FALSE;
-			//初始化保存数据相关变量
-			KeInitializeEvent(&ProtectVolumeList[Cur].FinishSaveDataEvent, SynchronizationEvent, FALSE);
-			ProtectVolumeList[Cur].CanSaveData = FALSE;
-			ProtectVolumeList[Cur].ShutdownSaveData = FALSE;
-			ProtectVolumeList[Cur].SavingData = FALSE;
-			//建立用来处理这个卷的请求的处理线程，线程函数的参数则是指向卷信息的指针
-			HANDLE ThreadHandle = NULL;
-			NTSTATUS status = PsCreateSystemThread(
-				&ThreadHandle,
-				(ACCESS_MASK)0L,
-				NULL,
-				NULL,
-				&ProtectVolumeList[Cur].ReadWriteThreadId,
-				ThreadReadWrite,
-				&ProtectVolumeList[Cur]
-			);
-			if (NT_SUCCESS(status))
-			{
-				if (NT_SUCCESS(InitVolumeLogicBitmap(&ProtectVolumeList[Cur])))
-				{
-					LogInfo("Successfully get volume logic bitmap\n");
-					// 只有在成功获取位图之后，才认为这个卷有效
-					ProtectVolumeList[Cur].CanSaveData = TRUE;
-					InterlockedExchange8((PCHAR)&ProtectVolumeList[Cur].Protect, TRUE);
-					InterlockedIncrement((PLONG)&ValidVolumeCount);
-					swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
-					LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_OK, strMsg, (ULONG)wcslen(strMsg));
-				}
-				else
-				{
-					ProtectVolumeList[Cur].ThreadTerminate = TRUE;
-					KeSetEvent(
-						&ProtectVolumeList[Cur].RequestEvent,
-						(KPRIORITY)0,
-						FALSE
-					);
-					// 等待线程结束以防止初始化下一个卷时覆盖数据导致蓝屏
-					KeWaitForSingleObject(
-						&ProtectVolumeList[Cur].FinishSaveDataEvent,
-						Executive,
-						KernelMode,
-						FALSE,
-						NULL
-					);
-					LogInfo("Failed to get volume logic bitmap\n");
-					swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
-					LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, (ULONG)wcslen(strMsg));
-				}
-
-				if (NULL != ThreadHandle)
-					ZwClose(ThreadHandle);
-			}
-			else
-			{
-				LogInfo("Failed to create handler thread\n");
-				swprintf_s(strMsg, 512, L"(%hu,%hu)", DiskNum, PartitionNum);
-				LogErrorMessageWithString(FilterDevice, MSG_PROTECT_VOLUME_LOAD_FAILED, strMsg, (ULONG)wcslen(strMsg));
-			}
+			LogInfo("Failed to enter protect\n");
 		}
 	}
 	LogInfo("ValidVolumeCount = %u\n", ValidVolumeCount);
-
-	InitVolumeLetter();
+	for (WCHAR i = L'A'; i <= L'Z'; i++)
+	{
+		ULONG DiskNum = 0;
+		ULONG PartitionNum = 0;
+		if (NT_SUCCESS(GetPartNumFromVolLetter(i, &DiskNum, &PartitionNum)))
+		{
+			if (FindProtectVolume(DiskNum, PartitionNum, TRUE))
+			{
+				ChangeDriveIconProtect(i, TRUE);
+			}
+		}
+	}
 }
 
 // 开始保护
@@ -910,7 +971,6 @@ void InitThawSpace()
 		if (CurDevice == NULL)
 			break;
 
-		ThawSpaceCloseFile(CurDevice);
 		Config.ThawSpacePath[i][MAX_PATH - 1] = L'\0';
 		WCHAR TCfg = Config.ThawSpacePath[i][MAX_PATH];
 		const WCHAR prefix[] = L"\\??\\";
@@ -1144,7 +1204,7 @@ NTSTATUS IsFileCreditable(PUNICODE_STRING filePath)
 
 	volumeInfo = FindProtectVolumeByDevice(GetVolumeDeviceByFileHandle(fileHandle));
 
-	if (!volumeInfo)
+	if (!volumeInfo || volumeInfo->ProtectStatus != 3)
 	{
 		LogWarn("Failed to get the volume information for file: %wZ\n", filePath);
 		goto out;
@@ -1352,18 +1412,27 @@ ULONGLONG GetRealSectorForWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULO
 	if (!DPBitmap_Test(volumeInfo->BitmapUsed, orgIndex))
 	{
 		// 不重定向, 直接标记为可直接写入
-		DPBitmap_Set(volumeInfo->BitmapUsed, orgIndex, TRUE);
-		DPBitmap_Set(volumeInfo->BitmapAllow, orgIndex, TRUE);
-		if (limitCount && nextCount)
+		if (NT_SUCCESS(DPBitmap_Set(volumeInfo->BitmapUsed, orgIndex, TRUE)))
 		{
-			ULONGLONG nextIndex = DPBitmap_FindNext(volumeInfo->BitmapUsed, orgIndex + 1, TRUE, limitCount);
-			if (nextIndex == (ULONGLONG)-1)
-				nextIndex = orgIndex + limitCount;
-			*nextCount = nextIndex - orgIndex - 1;
-			DPBitmap_SetRange(volumeInfo->BitmapUsed, orgIndex + 1, *nextCount, TRUE);
-			DPBitmap_SetRange(volumeInfo->BitmapAllow, orgIndex + 1, *nextCount, TRUE);
+			if (NT_SUCCESS(DPBitmap_Set(volumeInfo->BitmapAllow, orgIndex, TRUE)))
+			{
+				if (limitCount && nextCount)
+				{
+					ULONGLONG nextIndex = DPBitmap_FindNext(volumeInfo->BitmapUsed, orgIndex + 1, TRUE, limitCount);
+					if (nextIndex == (ULONGLONG)-1)
+						nextIndex = orgIndex + limitCount;
+					*nextCount = nextIndex - orgIndex - 1;
+					if (!NT_SUCCESS(DPBitmap_SetRange(volumeInfo->BitmapUsed, orgIndex + 1, *nextCount, TRUE)) || 
+						!NT_SUCCESS(DPBitmap_SetRange(volumeInfo->BitmapAllow, orgIndex + 1, *nextCount, TRUE)))
+					{
+						return (ULONGLONG)-1;
+					}
+				}
+				return orgIndex;
+			}
 		}
-		return orgIndex;
+		// 内存不足
+		return (ULONGLONG)-1;
 	}
 
 	// 此扇区是否已经被重定向
@@ -1383,16 +1452,23 @@ ULONGLONG GetRealSectorForWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULO
 			volumeInfo->LastScanIndex = mapIndex + 1;
 
 			// 标记为非空闲
-			DPBitmap_Set(volumeInfo->BitmapUsed, mapIndex, TRUE);
+			if (NT_SUCCESS(DPBitmap_Set(volumeInfo->BitmapUsed, mapIndex, TRUE)))
+			{
+				// 标记此扇区已被重定向(orgIndex)
+				if (NT_SUCCESS(DPBitmap_Set(volumeInfo->BitmapRedirect, orgIndex, TRUE)))
+				{
+					// 标记被重定向使用的扇区
+					if (NT_SUCCESS(DPBitmap_Set(volumeInfo->BitmapRedirectUsed, mapIndex, TRUE)))
+					{
+						// 优化：此处不加入重定向列表，重定向列表存储连续扇区，在最终操作时存入重定向列表
+						*needRedirect = TRUE;
+					}
+				}
+			}
 
-			// 标记此扇区已被重定向(orgIndex)
-			DPBitmap_Set(volumeInfo->BitmapRedirect, orgIndex, TRUE);
-
-			// 标记被重定向使用的扇区
-			DPBitmap_Set(volumeInfo->BitmapRedirectUsed, mapIndex, TRUE);
-			
-			// 优化：此处不加入重定向列表，重定向列表存储连续扇区，在最终操作时存入重定向列表
-			*needRedirect = TRUE;
+			// 内存不足
+			if (!*needRedirect)
+				mapIndex = (ULONGLONG)-1;
 		}
 	}
 
@@ -1453,7 +1529,7 @@ NTSTATUS HandleDiskRequest(
 
 		if (-1 == realIndex)
 		{
-			volumeInfo->CanSaveData = FALSE;
+			InterlockedExchange8((PCHAR)&volumeInfo->CanSaveData, FALSE);
 			if (!isFirstBlock)
 			{
 				status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], majorFunction, volumeInfo->StartOffset + prevOffset,
@@ -1808,24 +1884,11 @@ BOOLEAN SaveVolumeData(PVOLUME_INFO volumeInfo)
 	WCHAR Buf[256];
 	swprintf_s(Buf, 256, L"Saving data on volume %ls", VolName);
 	DisplayString(Buf);
-	PDP_BITMAP BitmapDepends = NULL;
-	NTSTATUS status = DPBitmap_Create(&BitmapDepends, volumeInfo->SectorCount, BITMAP_SLOT_SIZE);
-	if (!NT_SUCCESS(status))
+	ULONGLONG TotalRedirectSectors = DPBitmap_Count(volumeInfo->BitmapRedirect, TRUE);
+	if (!TotalRedirectSectors)
 	{
-		LogWarn("Failed to create bitmap, error code=0x%.8X\n", status);
-		swprintf_s(Buf, 256, L"\rFailed to save data on volume %ls. Error code=0x%.8X\n", VolName, status);
-		DisplayString(Buf);
-		return FALSE;
-	}
-	for (PREDIRECT_TABLE_NODE Iterator = RedirectTable_NextIterator(&volumeInfo->RedirectMap, NULL);
-		Iterator;
-		Iterator = RedirectTable_NextIterator(&volumeInfo->RedirectMap, Iterator))
-	{
-		for (ULONG i = 0; i < Iterator->Length; i++)
-		{
-			if (DPBitmap_Test(volumeInfo->BitmapRedirect, Iterator->NewStart + i))
-				DPBitmap_Set(BitmapDepends, Iterator->NewStart + i, TRUE);
-		}
+		LogInfo("No need to save data on volume %ls\n", VolName);
+		return TRUE;
 	}
 	typedef struct
 	{
@@ -1838,22 +1901,12 @@ BOOLEAN SaveVolumeData(PVOLUME_INFO volumeInfo)
 		Iterator;
 		Iterator = RedirectTable_NextIterator(&volumeInfo->RedirectMap, Iterator))
 	{
-		BOOLEAN Flag = TRUE;
-		for (ULONG Index = 0; Index < Iterator->Length; Index++)
-		{
-			if (DPBitmap_Test(BitmapDepends, Iterator->OrigStart + Index))
-			{
-				Flag = FALSE;
-				break;
-			}
-		}
-		if (Flag)
+		if (DPBitmap_TestRange(volumeInfo->BitmapRedirectUsed, Iterator->OrigStart, Iterator->Length, FALSE))
 		{
 			REDIRECT_QUEUE_ITEM *item = (REDIRECT_QUEUE_ITEM *)__malloc(sizeof(REDIRECT_QUEUE_ITEM));
 			if (!item)
 			{
 				LogWarn("Failed to allocate memory for queue item\n");
-				DPBitmap_Free(BitmapDepends);
 				while (!IsListEmpty(&RedirectQueue))
 				{
 					PLIST_ENTRY Entry = RemoveHeadList(&RedirectQueue);
@@ -1869,7 +1922,16 @@ BOOLEAN SaveVolumeData(PVOLUME_INFO volumeInfo)
 			InsertTailList(&RedirectQueue, &item->ListEntry);
 		}
 	}
-	ULONGLONG TotalRedirectSectors = DPBitmap_Count(volumeInfo->BitmapRedirect, TRUE);
+	{
+		PLIST_ENTRY Entry = RedirectQueue.Flink;
+		while (Entry != &RedirectQueue)
+		{
+			REDIRECT_QUEUE_ITEM* Item = CONTAINING_RECORD(Entry, REDIRECT_QUEUE_ITEM, ListEntry);
+			RedirectTable_DetachIterator(&volumeInfo->RedirectMap, Item->Iterator);
+			Entry = Entry->Flink;
+		}
+	}
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
 	int LastProgress = -1;
 	BOOLEAN IsDirty = FALSE;
 	while (!IsListEmpty(&RedirectQueue))
@@ -1904,60 +1966,65 @@ BOOLEAN SaveVolumeData(PVOLUME_INFO volumeInfo)
 			IsDirty = TRUE;
 			swprintf_s(Buf, 256, L"\rSave sector %llu->%llu (%lu) on volume %ls failed. Error code=0x%.8X\n", Item->Iterator->NewStart, Item->Iterator->OrigStart, Item->Iterator->Length, VolName, status);
 			DisplayString(Buf);
+			ASSERT(!IsDirty);
 		}
-		for (ULONG i = 0; i < Item->Iterator->Length; i++)
+		DPBitmap_SetRange(volumeInfo->BitmapRedirect, Item->Iterator->OrigStart, Item->Iterator->Length, FALSE);
+		DPBitmap_SetRange(volumeInfo->BitmapUsed, Item->Iterator->NewStart, Item->Iterator->Length, FALSE);
+		DPBitmap_SetRange(volumeInfo->BitmapRedirectUsed, Item->Iterator->NewStart, Item->Iterator->Length, FALSE);
+		ULONGLONG range_start = Item->Iterator->NewStart;
+		ULONGLONG range_end = Item->Iterator->NewStart + Item->Iterator->Length;
+		RedirectTable_FreeIterator(Item->Iterator);
+		__free(Item);
+		// 重新评估依赖：检查与释放区间重叠的尚未入队节点
+		// 1. 前一个可能重叠的节点（OrigStart < range_start）
+		PREDIRECT_TABLE_NODE prev = RedirectTable_LastLess(&volumeInfo->RedirectMap, range_start);
+		if (prev && prev->OrigStart + prev->Length > range_start)
 		{
-			DPBitmap_Set(volumeInfo->BitmapRedirect, Item->Iterator->OrigStart + i, FALSE);
-			ULONGLONG NewIndex = Item->Iterator->NewStart + i;
-			if (DPBitmap_Test(volumeInfo->BitmapRedirect, NewIndex))
-				DPBitmap_Set(BitmapDepends, NewIndex, FALSE);
-		}
-		for (ULONGLONG i = 0; i < Item->Iterator->Length; i++)
-		{
-			ULONGLONG NewIndex = Item->Iterator->NewStart + i;
-			if (DPBitmap_Test(volumeInfo->BitmapRedirect, NewIndex))
+			if (DPBitmap_TestRange(volumeInfo->BitmapRedirectUsed, prev->OrigStart, prev->Length, FALSE))
 			{
-				ULONGLONG MapIndex = (ULONGLONG)-1;
-				ULONGLONG NextCount = 0;
-				PREDIRECT_TABLE_NODE NewIterator = NULL;
-				RedirectTable_Lookup(&volumeInfo->RedirectMap, NewIndex, &MapIndex, &NextCount, &NewIterator);
-				if (NewIterator)
+				// 摘除并入队
+				REDIRECT_QUEUE_ITEM* item = (REDIRECT_QUEUE_ITEM*)__malloc(sizeof(REDIRECT_QUEUE_ITEM));
+				if (item)
 				{
-					BOOLEAN Flag = TRUE;
-					for (ULONG Index = 0; Index < NewIterator->Length; Index++)
-					{
-						if (DPBitmap_Test(BitmapDepends, NewIterator->OrigStart + Index))
-						{
-							Flag = FALSE;
-							break;
-						}
-					}
-					if (Flag)
-					{
-						REDIRECT_QUEUE_ITEM *item = (REDIRECT_QUEUE_ITEM *)__malloc(sizeof(REDIRECT_QUEUE_ITEM));
-						if (item)
-						{
-							item->Iterator = NewIterator;
-							InitializeListHead(&item->ListEntry);
-							InsertTailList(&RedirectQueue, &item->ListEntry);
-						}
-						else
-						{
-							LogErr("Failed to allocate memory for queue item\n");
-							IsDirty = TRUE;
-						}
-					}
+					RedirectTable_DetachIterator(&volumeInfo->RedirectMap, prev);
+					item->Iterator = prev;
+					InitializeListHead(&item->ListEntry);
+					InsertTailList(&RedirectQueue, &item->ListEntry);
 				}
 				else
 				{
-					LogErr("No redirect matched with sector %llu\n", NewIndex);
+					LogErr("Failed to allocate memory for queue item\n");
 					IsDirty = TRUE;
+					ASSERT(!IsDirty);
 				}
-				i += NextCount;
 			}
 		}
-		RedirectTable_DeleteIterator(&volumeInfo->RedirectMap, Item->Iterator);
-		__free(Item);
+		// 2. OrigStart 在 [range_start, range_end) 的节点
+		PREDIRECT_TABLE_NODE node = RedirectTable_LowerBound(&volumeInfo->RedirectMap, range_start);
+		while (node && node->OrigStart < range_end)
+		{
+			PREDIRECT_TABLE_NODE next = RedirectTable_NextIterator(&volumeInfo->RedirectMap, node);
+			// 这就是可能解除依赖的节点
+			if (DPBitmap_TestRange(volumeInfo->BitmapRedirectUsed, node->OrigStart, node->Length, FALSE))
+			{
+				// 无依赖，入队
+				REDIRECT_QUEUE_ITEM* item = (REDIRECT_QUEUE_ITEM*)__malloc(sizeof(REDIRECT_QUEUE_ITEM));
+				if (item)
+				{
+					RedirectTable_DetachIterator(&volumeInfo->RedirectMap, node);
+					item->Iterator = node;
+					InitializeListHead(&item->ListEntry);
+					InsertTailList(&RedirectQueue, &item->ListEntry);
+				}
+				else
+				{
+					LogErr("Failed to allocate memory for queue item\n");
+					IsDirty = TRUE;
+					ASSERT(!IsDirty);
+				}
+			}
+			node = next;
+		}
 		ULONGLONG CurrentCount = DPBitmap_Count(volumeInfo->BitmapRedirect, TRUE);
 		int CurProgress = int(100 * (TotalRedirectSectors - CurrentCount) / TotalRedirectSectors);
 		if (CurProgress != LastProgress)
@@ -1969,17 +2036,57 @@ BOOLEAN SaveVolumeData(PVOLUME_INFO volumeInfo)
 	}
 	if (IsDirty)
 		DisplayString(L"\rVolume is dirty, please run chkdsk.        \n");
-	DPBitmap_Free(BitmapDepends);
-	DPBitmap_Free(volumeInfo->BitmapUsed);
-	DPBitmap_Free(volumeInfo->BitmapRedirect);
-	DPBitmap_Free(volumeInfo->BitmapRedirectUsed);
-	DPBitmap_Free(volumeInfo->BitmapAllow);
-	RedirectTable_Free(&volumeInfo->RedirectMap);
-	RedirectTable_Free(&volumeInfo->ReverseRedirectMap);
-	// InterlockedExchange8((PCHAR)&volumeInfo->Protect, FALSE);
 	swprintf_s(Buf, 256, L"\rFinished saving data on volume %ls         \n", VolName);
 	DisplayString(Buf);
 	return TRUE;
+}
+
+// 退出保护
+NTSTATUS ExitProtectVolume(PVOLUME_INFO volumeInfo, BOOLEAN SaveData)
+{
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	if (SaveData)
+	{
+		if (volumeInfo->CanSaveData)
+		{
+			InterlockedExchange8((PCHAR)&volumeInfo->SavingData, TRUE);
+			KeSetEvent(
+				&volumeInfo->RequestEvent,
+				(KPRIORITY)0,
+				FALSE);
+			KeWaitForSingleObject(
+				&volumeInfo->FinishSaveDataEvent,
+				Executive,
+				KernelMode,
+				FALSE,
+				NULL
+			);
+			FlushVolume(volumeInfo->DiskNumber, volumeInfo->PartitionNumber);
+			status = STATUS_SUCCESS;
+			LogInfo("Volume (%hu,%hu) has exited protect state\n", volumeInfo->DiskNumber, volumeInfo->PartitionNumber);
+		}
+		else
+		{
+			status = STATUS_INVALID_DEVICE_REQUEST;
+			LogWarn("Volume (%hu,%hu) cannot save data and exit protect state\n", volumeInfo->DiskNumber, volumeInfo->PartitionNumber);
+		}
+	}
+	else
+	{
+		status = STATUS_NOT_IMPLEMENTED;
+		LogWarn("Volume (%hu,%hu) cannot exit protect state\n", volumeInfo->DiskNumber, volumeInfo->PartitionNumber);
+	}
+	if (NT_SUCCESS(status))
+	{
+		WCHAR VolumeLetter = volumeInfo->Volume;
+		if (VolumeLetter >= L'A' && VolumeLetter <= L'Z')
+			ChangeDriveIconProtect(VolumeLetter, FALSE);
+
+		WCHAR strMsg[20] = { 0 };
+		swprintf_s(strMsg, 20, L"(%hu,%hu)", volumeInfo->DiskNumber, volumeInfo->PartitionNumber);
+		LogErrorMessageWithString(FilterDevice, MSG_EXIT_PROTECT, strMsg, (ULONG)wcslen(strMsg));
+	}
+	return status;
 }
 
 // 读写操作线程
@@ -1997,6 +2104,7 @@ void ThreadReadWrite(PVOID Context)
 	PIO_STACK_LOCATION	io_stack = NULL;
 	//缓存IRP列表
 	LIST_ENTRY cacheIrpList;
+	LIST_ENTRY cacheSectorsList;
 	//irp中包括的数据地址
 	PVOID				buffer = NULL;
 	//irp中的数据长度
@@ -2011,9 +2119,113 @@ void ThreadReadWrite(PVOID Context)
 	KIRQL oldIrql;
 
 	InitializeListHead(&cacheIrpList);
+	InitializeListHead(&cacheSectorsList);
 
 	//设置这个线程的优先级
 	KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
+
+	struct CACHE_SECTORS
+	{
+		ULONGLONG Offset;
+		ULONG Length;
+		LIST_ENTRY ListEntry;
+	};
+
+	//等待位图初始化完成
+	UCHAR ProtectStatus;
+	while ((ProtectStatus = GetProtectStatus(volume_info)) <= 2)
+	{
+		//先等待请求队列同步事件，如果队列中没有irp需要处理，我们的线程就等待在这里，让出cpu时间给其它线程
+		KeWaitForSingleObject(
+			&volume_info->RequestEvent,
+			Executive,
+			KernelMode,
+			FALSE,
+			NULL
+		);
+		//如果有了线程结束标志，那么就在线程内部自己结束自己
+		if (volume_info->ThreadTerminate)
+		{
+			while ((ReqEntry = ExInterlockedRemoveHeadList(
+				&volume_info->ListHead,
+				&volume_info->ListLock
+			)) != NULL)
+			{
+				Irp = CONTAINING_RECORD(ReqEntry, IRP, Tail.Overlay.ListEntry);
+				IoSkipCurrentIrpStackLocation(Irp);
+				IoCallDriver(LowerDeviceObject[volume_info->DiskNumber], Irp);
+			}
+			InterlockedExchange8((PCHAR)&volume_info->ProtectStatus, 0);
+			KeSetEvent(&volume_info->FinishSaveDataEvent, (KPRIORITY)0, FALSE);
+			PsTerminateSystemThread(STATUS_SUCCESS);
+			return;
+		}
+		while ((ReqEntry = ExInterlockedRemoveHeadList(
+			&volume_info->ListHead,
+			&volume_info->ListLock
+		)) != NULL)
+		{
+			Irp = CONTAINING_RECORD(ReqEntry, IRP, Tail.Overlay.ListEntry);
+			if (Irp->Tail.Overlay.DriverContext[0] == (PVOID)1)
+			{
+				io_stack = IoGetCurrentIrpStackLocation(Irp);
+				if (IRP_MJ_WRITE == io_stack->MajorFunction)
+				{
+					CACHE_SECTORS *sectors = (CACHE_SECTORS *)__malloc(sizeof(CACHE_SECTORS));
+					if (sectors)
+					{
+						sectors->Offset = (max(volume_info->StartOffset, io_stack->Parameters.Write.ByteOffset.QuadPart) - volume_info->StartOffset) / volume_info->BytesPerSector;
+						sectors->Length = (ULONG)min(volume_info->SectorCount, io_stack->Parameters.Write.Length / volume_info->BytesPerSector);
+						InsertTailList(&cacheSectorsList, &sectors->ListEntry);
+					}
+				}
+				IoSkipCurrentIrpStackLocation(Irp);
+				IoCallDriver(LowerDeviceObject[volume_info->DiskNumber], Irp);
+			}
+			else
+			{
+				InsertTailList(&cacheIrpList, &Irp->Tail.Overlay.ListEntry);
+			}
+		}
+	}
+	KeWaitForSingleObject(
+		&volume_info->FinishBitmapEvent,
+		Executive,
+		KernelMode,
+		FALSE,
+		NULL
+	);
+	//如果有了线程结束标志，那么就在线程内部自己结束自己
+	if (volume_info->ThreadTerminate)
+	{
+		while (!IsListEmpty(&cacheIrpList))
+		{
+			ReqEntry = RemoveHeadList(&cacheIrpList);
+			Irp = CONTAINING_RECORD(ReqEntry, IRP, Tail.Overlay.ListEntry);
+			IoSkipCurrentIrpStackLocation(Irp);
+			IoCallDriver(LowerDeviceObject[volume_info->DiskNumber], Irp);
+		}
+		while ((ReqEntry = ExInterlockedRemoveHeadList(
+			&volume_info->ListHead,
+			&volume_info->ListLock
+		)) != NULL)
+		{
+			Irp = CONTAINING_RECORD(ReqEntry, IRP, Tail.Overlay.ListEntry);
+			IoSkipCurrentIrpStackLocation(Irp);
+			IoCallDriver(LowerDeviceObject[volume_info->DiskNumber], Irp);
+		}
+		InterlockedExchange8((PCHAR)&volume_info->ProtectStatus, 0);
+		KeSetEvent(&volume_info->FinishSaveDataEvent, (KPRIORITY)0, FALSE);
+		PsTerminateSystemThread(STATUS_SUCCESS);
+		return;
+	}
+	while (!IsListEmpty(&cacheSectorsList))
+	{
+		PLIST_ENTRY CacheEntry = RemoveHeadList(&cacheSectorsList);
+		CACHE_SECTORS* sectors = CONTAINING_RECORD(CacheEntry, CACHE_SECTORS, ListEntry);
+		DPBitmap_SetRange(volume_info->BitmapUsed, sectors->Offset, sectors->Length, TRUE);
+		__free(sectors);
+	}
 
 	//下面是线程的实现部分，这个循环永不退出
 	for (;;)
@@ -2029,18 +2241,51 @@ void ThreadReadWrite(PVOID Context)
 		//如果有了线程结束标志，那么就在线程内部自己结束自己
 		if (volume_info->ThreadTerminate)
 		{
+			while ((ReqEntry = ExInterlockedRemoveHeadList(
+				&volume_info->ListHead,
+				&volume_info->ListLock
+			)) != NULL)
+			{
+				Irp = CONTAINING_RECORD(ReqEntry, IRP, Tail.Overlay.ListEntry);
+				IoSkipCurrentIrpStackLocation(Irp);
+				IoCallDriver(LowerDeviceObject[volume_info->DiskNumber], Irp);
+			}
+			InterlockedExchange8((PCHAR)&volume_info->ProtectStatus, 0);
 			KeSetEvent(&volume_info->FinishSaveDataEvent, (KPRIORITY)0, FALSE);
 			PsTerminateSystemThread(STATUS_SUCCESS);
 			return;
 		}
-		//保存数据
+		// 保存数据
 		if (volume_info->SavingData)
 		{
 			if (SaveVolumeData(volume_info))
 				StopProtect = TRUE;
-			volume_info->SavingData = FALSE;
-			volume_info->CanSaveData = FALSE;
+			InterlockedExchange8((PCHAR)&volume_info->SavingData, FALSE);
+			InterlockedExchange8((PCHAR)&volume_info->CanSaveData, FALSE);
 			KeSetEvent(&volume_info->FinishSaveDataEvent, (KPRIORITY)0, FALSE);
+		}
+		// 停止保护标志
+		if (StopProtect)
+		{
+			InterlockedExchange8((PCHAR)&volume_info->ProtectStatus, 4);
+			while ((ReqEntry = ExInterlockedRemoveHeadList(
+				&volume_info->ListHead,
+				&volume_info->ListLock
+			)) != NULL)
+			{
+				Irp = CONTAINING_RECORD(ReqEntry, IRP, Tail.Overlay.ListEntry);
+				IoSkipCurrentIrpStackLocation(Irp);
+				IoCallDriver(LowerDeviceObject[volume_info->DiskNumber], Irp);
+			}
+			DPBitmap_Free(volume_info->BitmapUsed);
+			DPBitmap_Free(volume_info->BitmapRedirect);
+			DPBitmap_Free(volume_info->BitmapRedirectUsed);
+			DPBitmap_Free(volume_info->BitmapAllow);
+			RedirectTable_Free(&volume_info->RedirectMap);
+			RedirectTable_Free(&volume_info->ReverseRedirectMap);
+			volume_info->LastScanIndex = volume_info->FirstDataSector;
+			PsTerminateSystemThread(STATUS_SUCCESS);
+			return;
 		}
 		// 批量取出所有待处理 IRP
 		KeAcquireSpinLock(&volume_info->ListLock, &oldIrql);
@@ -2114,38 +2359,24 @@ void ThreadReadWrite(PVOID Context)
 
 			if (bufaddr)
 			{
-				// 停止保护状态或直接读写
-				if (StopProtect || IsDirectDiskDevice(io_stack->DeviceObject))
+				// 直接读写
+				if (IsDirectDiskDevice(io_stack->DeviceObject))
 				{
-					status = STATUS_SUCCESS;
-					if (IsDirectDiskDevice(io_stack->DeviceObject))
-					{
-						if (!AllowDirectMount)
-							status = STATUS_INVALID_DEVICE_REQUEST;
-						else if (StopProtect)
-							offset.QuadPart += volume_info->StartOffset;
-					}
-					if (NT_SUCCESS(status))
+					if (!AllowDirectMount)
+						status = STATUS_INVALID_DEVICE_REQUEST;
+					else
 					{
 						if (IRP_MJ_READ == io_stack->MajorFunction)
 						{
-							if (StopProtect)
-								status = FastFsdRequest(LowerDeviceObject[volume_info->DiskNumber], io_stack->MajorFunction, offset.QuadPart,
-									newbuff, length, TRUE);
-							else
-								status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
-									newbuff, length);
+							status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
+								newbuff, length);
 							RtlCopyMemory(buffer, newbuff, length);
 						}
 						else
 						{
 							RtlCopyMemory(newbuff, buffer, length);
-							if (StopProtect)
-								status = FastFsdRequest(LowerDeviceObject[volume_info->DiskNumber], io_stack->MajorFunction, offset.QuadPart,
-									newbuff, length, TRUE);
-							else
-								status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
-									newbuff, length);
+							status = HandleDirectDiskRequest(volume_info, io_stack->MajorFunction, offset.QuadPart,
+								newbuff, length);
 						}
 					}
 				}
@@ -2246,13 +2477,6 @@ void ThreadReadWrite(PVOID Context)
 			}
 			continue;
 		}
-		// 停止保护标志
-		if (StopProtect)
-		{
-			InterlockedExchange8((PCHAR)&volume_info->Protect, FALSE);
-			PsTerminateSystemThread(STATUS_SUCCESS);
-			return;
-		}
 	}
 }
 
@@ -2304,7 +2528,11 @@ OnDiskFilterReadWrite(
 	for (UINT i = 0; i < ValidVolumeCount; i++)
 	{
 		// 卷是否在受保护的硬盘上
-		if (ProtectVolumeList[i].DiskNumber != DeviceNumber || !ProtectVolumeList[i].Protect)
+		if (ProtectVolumeList[i].DiskNumber != DeviceNumber)
+			continue;
+
+		UCHAR ProtectStatus = GetProtectStatus(&ProtectVolumeList[i]);
+		if (ProtectStatus > 3 || ProtectStatus < 1)
 			continue;
 
 		if ((offset.QuadPart >= ProtectVolumeList[i].StartOffset &&
@@ -2323,6 +2551,12 @@ OnDiskFilterReadWrite(
 			//这个卷在保护状态，
 			//我们首先把这个irp设为pending状态
 			IoMarkIrpPending(Irp);
+
+			if (ProtectStatus == 1 || ProtectStatus == 2)
+			{
+				// 用IRP中的DriverContext传递卷的保护状态, 反正现在这个参数用不着
+				Irp->Tail.Overlay.DriverContext[0] = (PVOID)1;
+			}
 
 			KeAcquireSpinLock(&ProtectVolumeList[i].ListLock, &oldIrql);
 			wasEmpty = IsListEmpty(&ProtectVolumeList[i].ListHead);
@@ -2477,7 +2711,7 @@ OnDiskFilterDispatchControl(
 							USHORT DiskNum = DISKFILTER_DISKNUM_FROM_VOLNUM(VolNum);
 							USHORT PartNum = DISKFILTER_PARTNUM_FROM_VOLNUM(VolNum);
 							PVOLUME_INFO Volume = FindProtectVolume(DiskNum, PartNum);
-							if (Volume != NULL)
+							if (Volume != NULL && Volume->ProtectStatus == 3)
 							{
 								ULONGLONG SectorUsed = DPBitmap_Count(Volume->BitmapRedirectUsed, TRUE);
 								ULONGLONG SectorFree = DPBitmap_Count(Volume->BitmapUsed, FALSE);
@@ -2557,10 +2791,14 @@ OnDiskFilterDispatchControl(
 							CurStatus.AllowDriverLoad = AllowLoadDriver;
 							CurStatus.ProtectEnabled = IsProtect;
 							CurStatus.DirectMountEnabled = AllowDirectMount;
-							CurStatus.ProtectVolumeCount = (UCHAR)ValidVolumeCount;
+							CurStatus.ProtectVolumeCount = 0;
 							for (UCHAR i = 0; i < ValidVolumeCount; i++)
 							{
-								CurStatus.ProtectVolume[i] = DISKFILTER_MAKE_VOLNUM(ProtectVolumeList[i].DiskNumber, ProtectVolumeList[i].PartitionNumber);
+								if (ProtectVolumeList[i].ProtectStatus == 3)
+								{
+									CurStatus.ProtectVolume[CurStatus.ProtectVolumeCount] = DISKFILTER_MAKE_VOLNUM(ProtectVolumeList[i].DiskNumber, ProtectVolumeList[i].PartitionNumber);
+									CurStatus.ProtectVolumeCount++;
+								}
 							}
 							RtlCopyMemory(SystemBuffer, &CurStatus, sizeof(CurStatus));
 							info = sizeof(CurStatus);
@@ -2594,7 +2832,7 @@ OnDiskFilterDispatchControl(
 							break;
 						}
 						PVOLUME_INFO ProtectedVolume = FindProtectVolume(DirectDiskInfo.DiskNumber, DirectDiskInfo.PartitionNumber);
-						if (ProtectedVolume == NULL)
+						if (ProtectedVolume == NULL || ProtectedVolume->ProtectStatus != 3)
 						{
 							*Status = STATUS_NOT_FOUND;
 							break;
@@ -2672,7 +2910,7 @@ OnDiskFilterDispatchControl(
 						DISKFILTER_SAVEDATA SaveDataInfo;
 						RtlCopyMemory(&SaveDataInfo, &Data->Config, sizeof(SaveDataInfo));
 						PVOLUME_INFO ProtectedVolume = FindProtectVolume(SaveDataInfo.DiskNumber, SaveDataInfo.PartitionNumber);
-						if (ProtectedVolume == NULL || !ProtectedVolume->CanSaveData)
+						if (ProtectedVolume == NULL || ProtectedVolume->ProtectStatus != 3 || !ProtectedVolume->CanSaveData)
 						{
 							*Status = STATUS_NOT_FOUND;
 							break;
@@ -2694,7 +2932,7 @@ OnDiskFilterDispatchControl(
 						DISKFILTER_SAVEDATA SaveDataInfo;
 						RtlCopyMemory(&SaveDataInfo, &Data->Config, sizeof(SaveDataInfo));
 						PVOLUME_INFO ProtectedVolume = FindProtectVolume(SaveDataInfo.DiskNumber, SaveDataInfo.PartitionNumber);
-						if (ProtectedVolume == NULL || !ProtectedVolume->CanSaveData)
+						if (ProtectedVolume == NULL || ProtectedVolume->ProtectStatus != 3 || !ProtectedVolume->CanSaveData)
 						{
 							*Status = STATUS_NOT_FOUND;
 							break;
@@ -2734,6 +2972,31 @@ OnDiskFilterDispatchControl(
 							*Status = STATUS_BUFFER_TOO_SMALL;
 						}
 						break;
+					case DISKFILTER_CONTROL_UPDATE_PROTECT:
+					{
+						DISKFILTER_UPDATE_PROTECT UpdateProtectInfo;
+						RtlCopyMemory(&UpdateProtectInfo, &Data->Config, sizeof(UpdateProtectInfo));
+						PVOLUME_INFO ProtectedVolume = FindProtectVolume(UpdateProtectInfo.DiskNumber, UpdateProtectInfo.PartitionNumber, FALSE);
+						if (!UpdateProtectInfo.Protect)
+						{
+							if (ProtectedVolume == NULL || ProtectedVolume->ProtectStatus != 3)
+							{
+								*Status = STATUS_SUCCESS;
+								break;
+							}
+							*Status = ExitProtectVolume(ProtectedVolume, UpdateProtectInfo.SaveData);
+						}
+						else
+						{
+							if (ProtectedVolume != NULL && ProtectedVolume->ProtectStatus == 3)
+							{
+								*Status = STATUS_SUCCESS;
+								break;
+							}
+							*Status = EnterProtectVolume(ProtectedVolume, UpdateProtectInfo.DiskNumber, UpdateProtectInfo.PartitionNumber);
+						}
+						break;
+					}
 					default:
 						break;
 					}
@@ -2974,7 +3237,8 @@ void DriverReinit(PDRIVER_OBJECT DriverObject, PVOID Context, ULONG Count)
 
 	InitThawSpace();
 
-	DirectDiskInit(DriverObject);
+	if (AllowDirectMount)
+		DirectDiskInit(DriverObject);
 
 	PsSetLoadImageNotifyRoutine(&LoadDriverNotify);
 
@@ -3010,7 +3274,7 @@ OnDiskFilterInitialization(
 	memset(VolumeList, 0, sizeof(VolumeList));
 	ValidVolumeCount = 0;
 	memset(ProtectDiskList, 0, sizeof(ProtectDiskList));
-	memset(&ConfigVolume, 0, sizeof(ConfigVolume));
+	ConfigVolumeLetter = 0;
 	ConfigVcnPairs = NULL;
 	IsProtect = FALSE;
 	AllowLoadDriver = TRUE;

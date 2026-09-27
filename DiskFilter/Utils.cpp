@@ -16,6 +16,7 @@ NTSTATUS KSleep(ULONG milliSeconds)
 	return STATUS_SUCCESS;
 }
 
+/*
 NTSTATUS WriteReadOnlyMemory(
 	PVOID lpDest,
 	PVOID lpSource,
@@ -50,6 +51,68 @@ NTSTATUS WriteReadOnlyMemory(
 	IoFreeMdl(pMdlMemory);
 	return status;
 }
+*/
+
+NTSTATUS WriteReadOnlyMemory(
+	PVOID lpDest,
+	PVOID lpSource,
+	ULONG ulSize
+)
+{
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	PMDL pMdl = NULL;
+	PVOID lpWritableAddress = NULL;
+	BOOLEAN bLocked = FALSE;
+	BOOLEAN bMapped = FALSE;
+
+	if (lpDest == NULL || lpSource == NULL || ulSize == 0)
+		return STATUS_INVALID_PARAMETER;
+
+	pMdl = IoAllocateMdl(lpDest, ulSize, FALSE, FALSE, NULL);
+	if (pMdl == NULL)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	__try
+	{
+		MmProbeAndLockPages(pMdl, KernelMode, IoReadAccess);
+		bLocked = TRUE;
+
+		lpWritableAddress = MmMapLockedPagesSpecifyCache(
+			pMdl,
+			KernelMode,
+			MmCached,
+			NULL,
+			FALSE,
+			NormalPagePriority
+		);
+
+		if (lpWritableAddress == NULL)
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			__leave;
+		}
+
+		bMapped = TRUE;
+
+		RtlCopyMemory(lpWritableAddress, lpSource, ulSize);
+		status = STATUS_SUCCESS;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		status = GetExceptionCode();
+	}
+
+	if (bMapped)
+		MmUnmapLockedPages(lpWritableAddress, pMdl);
+
+	if (bLocked)
+		MmUnlockPages(pMdl);
+
+	if (pMdl)
+		IoFreeMdl(pMdl);
+
+	return status;
+}
 
 #define rightrotate(w, n) ((w >> n) | (w) << (32-(n)))
 #define copy_uint32(p, val) *((UINT32 *)p) = swap_endian<UINT32>((val))
@@ -79,6 +142,11 @@ void SHA256(const PVOID lpData, SIZE_T ulSize, UCHAR lpOutput[32])
 	int append = ((r < 448) ? (448 - r) : (448 + 512 - r)) / 8;
 	SIZE_T new_len = ulSize + append + 8;
 	PUCHAR buf = (PUCHAR)__malloc(new_len);
+	if (!buf)
+	{
+		RtlZeroMemory(lpOutput, sizeof(lpOutput));
+		return;
+	}
 	RtlZeroMemory(buf + ulSize, append);
 	RtlCopyMemory(buf, lpData, ulSize);
 	buf[ulSize] = 0x80;
@@ -152,21 +220,26 @@ void SHA256(const PVOID lpData, SIZE_T ulSize, UCHAR lpOutput[32])
 
 BOOL bitmap_test(ULONG *bitmap, ULONGLONG index)
 {
-	// return ((BYTE *)BitmapDetail)[Cluster / 8] & (1 << (Cluster % 8));
-	// return ((bitmap[index / 8 / sizeof(ULONG)] & (1ul << (index % (8 * sizeof(ULONG))))) ? TRUE : FALSE);
 	return _bittest((LONG *)&bitmap[index / 8 / sizeof(ULONG)], index % (8 * sizeof(ULONG)));
 }
 
 void bitmap_set(ULONG *bitmap, ULONGLONG index, BOOL val)
 {
-	// if (val)
-	// 	bitmap[index / 8 / sizeof(ULONG)] |= (1ul << (index % (8 * sizeof(ULONG))));
-	// else
-	// 	bitmap[index / 8 / sizeof(ULONG)] &= ~(1ul << (index % (8 * sizeof(ULONG))));
 	if (val)
 		_bittestandset((LONG*)&bitmap[index / 8 / sizeof(ULONG)], index % (8 * sizeof(ULONG)));
 	else
 		_bittestandreset((LONG*)&bitmap[index / 8 / sizeof(ULONG)], index % (8 * sizeof(ULONG)));
+}
+
+NTSTATUS CreateUuid(PGUID uuid)
+{
+	NTSTATUS status;
+	int retries = 5;
+	do
+	{
+		status = ExUuidCreate(uuid);
+	} while (!NT_SUCCESS(status) && retries-- > 0);
+	return status;
 }
 
 NTSTATUS RtlAllocateUnicodeString(PUNICODE_STRING us, ULONG maxLength)
@@ -200,7 +273,7 @@ NTSTATUS GetFileHandleReadOnly(PHANDLE fileHandle, PUNICODE_STRING fileName)
 
 	InitializeObjectAttributes(&oa,
 		fileName,
-		OBJ_CASE_INSENSITIVE,
+		OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
 		NULL,
 		NULL);
 
@@ -210,11 +283,42 @@ NTSTATUS GetFileHandleReadOnly(PHANDLE fileHandle, PUNICODE_STRING fileName)
 		&IoStatusBlock,
 		NULL,
 		0,
-		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 		FILE_OPEN,
 		FILE_SYNCHRONOUS_IO_NONALERT,
 		NULL,
 		0);
+}
+
+NTSTATUS GetFileHandleReadOnlyBackup(PHANDLE fileHandle, PUNICODE_STRING fileName)
+{
+	OBJECT_ATTRIBUTES oa;
+	IO_STATUS_BLOCK IoStatusBlock;
+	NTSTATUS status;
+
+	AdjustPrivilege(SE_BACKUP_PRIVILEGE, TRUE);
+
+	InitializeObjectAttributes(&oa,
+		fileName,
+		OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+		NULL,
+		NULL);
+
+	status = ZwCreateFile(fileHandle,
+		GENERIC_READ | SYNCHRONIZE,
+		&oa,
+		&IoStatusBlock,
+		NULL,
+		0,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		FILE_OPEN,
+		FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT,
+		NULL,
+		0);
+
+	AdjustPrivilege(SE_BACKUP_PRIVILEGE, FALSE);
+
+	return status;
 }
 
 PVOID GetSystemInfo(SYSTEM_INFORMATION_CLASS InfoClass)
@@ -271,18 +375,12 @@ NTSTATUS ReadFileAlign(HANDLE FileHandle, PVOID Buffer, ULONG Length, ULONG Alig
 	return status;
 }
 
-NTSTATUS GetVolumeBitmapInfo(ULONG DiskNum, ULONG PartitionNum, PVOLUME_BITMAP_BUFFER *lpBitmap)
+NTSTATUS GetVolumeHandleReadOnly(ULONG DiskNum, ULONG PartitionNum, PHANDLE FileHandle)
 {
-	NTSTATUS status;
-	HANDLE FileHandle;
-	UNICODE_STRING FileName;
-	OBJECT_ATTRIBUTES oa;
-	IO_STATUS_BLOCK IoStatusBlock;
-
 	WCHAR VolumeName[MAX_PATH];
-
-	if (!lpBitmap)
-		return STATUS_UNSUCCESSFUL;
+	UNICODE_STRING FileName;
+	IO_STATUS_BLOCK IoStatus;
+	OBJECT_ATTRIBUTES oa;
 
 	swprintf_s(VolumeName, MAX_PATH, L"\\Device\\Harddisk%d\\Partition%d", DiskNum, PartitionNum);
 
@@ -290,21 +388,52 @@ NTSTATUS GetVolumeBitmapInfo(ULONG DiskNum, ULONG PartitionNum, PVOLUME_BITMAP_B
 
 	InitializeObjectAttributes(&oa, &FileName, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-	status = ZwCreateFile(&FileHandle,
-		GENERIC_ALL | SYNCHRONIZE,
+	return ZwCreateFile(FileHandle,
+		GENERIC_READ | SYNCHRONIZE,
 		&oa,
-		&IoStatusBlock,
+		&IoStatus,
 		NULL,
 		0,
-		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 		FILE_OPEN,
 		FILE_SYNCHRONOUS_IO_NONALERT,	// 同步读写
 		NULL,
 		0);
+}
 
+NTSTATUS FlushVolume(ULONG DiskNum, ULONG PartitionNum)
+{
+	NTSTATUS status;
+	HANDLE FileHandle;
+
+	status = GetVolumeHandleReadOnly(DiskNum, PartitionNum, &FileHandle);
 	if (NT_SUCCESS(status))
 	{
-		IO_STATUS_BLOCK	ioBlock;
+		PDEVICE_OBJECT VolumeDevice = GetVolumeDeviceByFileHandle(FileHandle);
+		ZwClose(FileHandle);
+		if (VolumeDevice != NULL)
+		{
+			status = FastFsdRequest(VolumeDevice, IRP_MJ_FLUSH_BUFFERS, 0, NULL, 0, TRUE);
+		}
+		else
+			status = STATUS_UNSUCCESSFUL;
+	}
+
+	return status;
+}
+
+NTSTATUS GetVolumeBitmapInfo(ULONG DiskNum, ULONG PartitionNum, PVOLUME_BITMAP_BUFFER *lpBitmap)
+{
+	NTSTATUS status;
+	HANDLE FileHandle;
+
+	if (!lpBitmap)
+		return STATUS_UNSUCCESSFUL;
+
+	status = GetVolumeHandleReadOnly(DiskNum, PartitionNum, &FileHandle);
+	if (NT_SUCCESS(status))
+	{
+		IO_STATUS_BLOCK	IoStatus;
 		PVOLUME_BITMAP_BUFFER pInfo = NULL;
 		STARTING_LCN_INPUT_BUFFER StartingLCN;
 		ULONG BitmapSize = 0;
@@ -325,7 +454,7 @@ NTSTATUS GetVolumeBitmapInfo(ULONG DiskNum, ULONG PartitionNum, PVOLUME_BITMAP_B
 				NULL,
 				NULL,
 				NULL,
-				&ioBlock,
+				&IoStatus,
 				FSCTL_GET_VOLUME_BITMAP,
 				&StartingLCN,
 				sizeof(StartingLCN),
@@ -565,31 +694,12 @@ NTSTATUS GetPartNumFromVolLetter(WCHAR Letter, PULONG DiskNum, PULONG PartitionN
 	NTSTATUS status;
 	HANDLE fileHandle;
 	UNICODE_STRING fileName;
-	OBJECT_ATTRIBUTES oa;
-	IO_STATUS_BLOCK IoStatusBlock;
 
 	WCHAR volumeDosName[MAX_PATH];
 	swprintf_s(volumeDosName, MAX_PATH, L"\\??\\%c:", Letter);
 
 	RtlInitUnicodeString(&fileName, volumeDosName);
-
-	InitializeObjectAttributes(&oa,
-		&fileName,
-		OBJ_CASE_INSENSITIVE,
-		NULL,
-		NULL);
-
-	status = ZwCreateFile(&fileHandle,
-		GENERIC_ALL | SYNCHRONIZE,
-		&oa,
-		&IoStatusBlock,
-		NULL,
-		0,
-		FILE_SHARE_READ | FILE_SHARE_WRITE,
-		FILE_OPEN,
-		FILE_SYNCHRONOUS_IO_NONALERT,	// 同步读写
-		NULL,
-		0);
+	status = GetFileHandleReadOnly(&fileHandle, &fileName);
 
 	if (NT_SUCCESS(status))
 	{
@@ -647,7 +757,22 @@ NTSTATUS GetPartNumFromVolLetter(WCHAR Letter, PULONG DiskNum, PULONG PartitionN
 	return status;
 }
 
-void ChangeDriveIconProtect(WCHAR volume)
+WCHAR GetVolumeLetter(ULONG DiskNum, ULONG PartitionNum)
+{
+	for (WCHAR i = L'A'; i <= L'Z'; i++)
+	{
+		ULONG VolDiskNum = 0;
+		DWORD VolPartitionNum = 0;
+		if (NT_SUCCESS(GetPartNumFromVolLetter(i, &VolDiskNum, &VolPartitionNum)))
+		{
+			if (DiskNum == VolDiskNum && PartitionNum == VolPartitionNum)
+				return i;
+		}
+	}
+	return 0;
+}
+
+void ChangeDriveIconProtect(WCHAR volume, BOOLEAN Protect)
 {
 	HANDLE	keyHandle;
 	UNICODE_STRING	keyPath;
@@ -714,24 +839,32 @@ void ChangeDriveIconProtect(WCHAR volume)
 
 			if (NT_SUCCESS(status))
 			{
-				UNICODE_STRING	keyName;
-				WCHAR iconPath[] = L"%SystemRoot%\\System32\\drivers\\diskflt.sys,0";
-				WCHAR iconPathWin7[] = L"%SystemRoot%\\System32\\drivers\\diskflt.sys,1";
-				WCHAR iconPathWin10[] = L"%SystemRoot%\\System32\\drivers\\diskflt.sys,2";
-
-				RtlInitUnicodeString(&keyName, L"");
-
-				if (*NtBuildNumber <= 3790)
+				if (Protect)
 				{
-					status = ZwSetValueKey(subsubKey, &keyName, 0, REG_SZ, iconPath, sizeof(iconPath));
-				}
-				else if (*NtBuildNumber <= 9600)
-				{
-					status = ZwSetValueKey(subsubKey, &keyName, 0, REG_SZ, iconPathWin7, sizeof(iconPathWin7));
+					UNICODE_STRING	keyName;
+					WCHAR iconPath[] = L"%SystemRoot%\\System32\\drivers\\diskflt.sys,0";
+					WCHAR iconPathWin7[] = L"%SystemRoot%\\System32\\drivers\\diskflt.sys,1";
+					WCHAR iconPathWin10[] = L"%SystemRoot%\\System32\\drivers\\diskflt.sys,2";
+
+					RtlInitUnicodeString(&keyName, L"");
+
+					if (*NtBuildNumber <= 3790)
+					{
+						status = ZwSetValueKey(subsubKey, &keyName, 0, REG_SZ, iconPath, sizeof(iconPath));
+					}
+					else if (*NtBuildNumber <= 9600)
+					{
+						status = ZwSetValueKey(subsubKey, &keyName, 0, REG_SZ, iconPathWin7, sizeof(iconPathWin7));
+					}
+					else
+					{
+						status = ZwSetValueKey(subsubKey, &keyName, 0, REG_SZ, iconPathWin10, sizeof(iconPathWin10));
+					}
 				}
 				else
 				{
-					status = ZwSetValueKey(subsubKey, &keyName, 0, REG_SZ, iconPathWin10, sizeof(iconPathWin10));
+					status = ZwDeleteKey(subsubKey);
+					status = ZwDeleteKey(subKey);
 				}
 
 				ZwClose(subsubKey);
@@ -767,75 +900,6 @@ wchar_t * wcsstr_n(const wchar_t *string, size_t count, const wchar_t *strCharSe
 	}
 
 	return(NULL);
-}
-
-NTSTATUS
-FltReadWriteSectorsCompletion(
-	IN PDEVICE_OBJECT DeviceObject,
-	IN PIRP Irp,
-	IN PVOID Context
-)
-/*++
-Routine Description:
-A completion routine for use when calling the lower device objects to
-which our filter deviceobject is attached.
-
-Arguments:
-
-DeviceObject - Pointer to deviceobject
-Irp        - Pointer to a PnP Irp.
-Context    - NULL or PKEVENT
-Return Value:
-
-NT Status is returned.
-
---*/
-{
-	PMDL    mdl;
-
-	UNREFERENCED_PARAMETER(DeviceObject);
-
-	if (!NT_SUCCESS(Irp->IoStatus.Status))
-	{
-		PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
-		LogErr("Disk IO error! DeviceObject=%p, MajorFunction=%d, Offset=%llu, Length=%u, Status=0x%.8X\n",
-			DeviceObject, irpStack->MajorFunction, irpStack->Parameters.Read.ByteOffset.QuadPart, irpStack->Parameters.Read.Length, Irp->IoStatus.Status);
-	}
-
-	// 
-	// Free resources 
-	// 
-
-	if (Irp->AssociatedIrp.SystemBuffer && (Irp->Flags & IRP_DEALLOCATE_BUFFER)) {
-		__free(Irp->AssociatedIrp.SystemBuffer);
-	}
-
-	/*
-	因为这个 IRP 就是在我这层次建立的，上层本就不知道有这么一个 IRP。
-	那么到这里我就要在 CompleteRoutine 中使用 IoFreeIrp()来释放掉这个 IRP，
-	并返回STATUS_MORE_PROCESSING_REQUIRED不让它继续传递。这里一定要注意，
-	在 CompleteRoutine函数返回后，这个 IRP 已经释放了，
-	如果这个时候在有任何关于这个 IRP 的操作那么后果是灾难性的，必定导致 BSOD 错误。
-	*/
-	while (Irp->MdlAddress) {
-		mdl = Irp->MdlAddress;
-		Irp->MdlAddress = mdl->Next;
-		MmUnlockPages(mdl);
-		IoFreeMdl(mdl);
-	}
-
-	if (Irp->PendingReturned && (Context != NULL)) {
-		if (Irp->UserIosb)
-			*Irp->UserIosb = Irp->IoStatus;
-		KeSetEvent((PKEVENT)Context, IO_DISK_INCREMENT, FALSE);
-	}
-
-	IoFreeIrp(Irp);
-
-	// 
-	// Don't touch irp any more 
-	// 
-	return STATUS_MORE_PROCESSING_REQUIRED;
 }
 
 NTSTATUS FastFsdRequest(
@@ -1307,16 +1371,126 @@ void SafeReboot()
 	NtShutdownSystem(1);
 }
 
+NTSTATUS MountMgrMountVolume(PUNICODE_STRING DeviceName, PUNICODE_STRING TargetPath)
+{
+	HANDLE FileHandle = NULL;
+	UNICODE_STRING FileName;
+	IO_STATUS_BLOCK IoStatus;
+	OBJECT_ATTRIBUTES oa;
+	NTSTATUS status;
+
+	RtlInitUnicodeString(&FileName, MOUNTMGR_DEVICE_NAME);
+
+	InitializeObjectAttributes(&oa, &FileName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+	status = ZwCreateFile(&FileHandle,
+		GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+		&oa,
+		&IoStatus,
+		NULL,
+		0,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		FILE_OPEN,
+		FILE_SYNCHRONOUS_IO_NONALERT,
+		NULL,
+		0);
+
+	if (NT_SUCCESS(status))
+	{
+		ULONG TargetSize = sizeof(MOUNTMGR_TARGET_NAME) + DeviceName->Length;
+		PMOUNTMGR_TARGET_NAME TargetName = (PMOUNTMGR_TARGET_NAME)__malloc(TargetSize);
+		if (TargetName)
+		{
+			RtlZeroMemory(TargetName, TargetSize);
+			TargetName->DeviceNameLength = DeviceName->Length;
+			RtlCopyMemory(TargetName->DeviceName, DeviceName->Buffer, TargetName->DeviceNameLength);
+			status = ZwDeviceIoControlFile(FileHandle, NULL, NULL, NULL, &IoStatus, IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION, TargetName, TargetSize, NULL, 0);
+			if (NT_SUCCESS(status))
+			{
+				TargetSize = sizeof(MOUNTMGR_CREATE_POINT_INPUT) + DeviceName->Length + TargetPath->Length;
+				PMOUNTMGR_CREATE_POINT_INPUT MountPoint = (PMOUNTMGR_CREATE_POINT_INPUT)__malloc(TargetSize);
+				if (MountPoint)
+				{
+					RtlZeroMemory(MountPoint, TargetSize);
+					MountPoint->SymbolicLinkNameOffset = sizeof(MOUNTMGR_CREATE_POINT_INPUT);
+					MountPoint->SymbolicLinkNameLength = TargetPath->Length;
+					RtlCopyMemory((PUCHAR)MountPoint + MountPoint->SymbolicLinkNameOffset, TargetPath->Buffer, MountPoint->SymbolicLinkNameLength);
+					MountPoint->DeviceNameOffset = MountPoint->SymbolicLinkNameOffset + MountPoint->SymbolicLinkNameLength;
+					MountPoint->DeviceNameLength = DeviceName->Length;
+					RtlCopyMemory((PUCHAR)MountPoint + MountPoint->DeviceNameOffset, DeviceName->Buffer, MountPoint->DeviceNameLength);
+					status = ZwDeviceIoControlFile(FileHandle, NULL, NULL, NULL, &IoStatus, IOCTL_MOUNTMGR_CREATE_POINT, MountPoint, TargetSize, NULL, 0);
+				}
+				__free(MountPoint);
+			}
+			__free(TargetName);
+		}
+	}
+	ZwClose(FileHandle);
+	return status;
+}
+
+NTSTATUS MountMgrUnmountVolume(PUNICODE_STRING TargetPath)
+{
+	HANDLE FileHandle = NULL;
+	UNICODE_STRING FileName;
+	IO_STATUS_BLOCK IoStatus;
+	OBJECT_ATTRIBUTES oa;
+	NTSTATUS status;
+
+	RtlInitUnicodeString(&FileName, MOUNTMGR_DEVICE_NAME);
+
+	InitializeObjectAttributes(&oa, &FileName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+	status = ZwCreateFile(&FileHandle,
+		GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+		&oa,
+		&IoStatus,
+		NULL,
+		0,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		FILE_OPEN,
+		FILE_SYNCHRONOUS_IO_NONALERT,
+		NULL,
+		0);
+
+	if (NT_SUCCESS(status))
+	{
+		ULONG TargetSize = sizeof(MOUNTMGR_MOUNT_POINT) + TargetPath->Length;
+		PMOUNTMGR_MOUNT_POINT MountPoint = (PMOUNTMGR_MOUNT_POINT)__malloc(TargetSize);
+		if (MountPoint)
+		{
+			RtlZeroMemory(MountPoint, TargetSize);
+			MountPoint->SymbolicLinkNameOffset = sizeof(MOUNTMGR_MOUNT_POINT);
+			MountPoint->SymbolicLinkNameLength = TargetPath->Length;
+			RtlCopyMemory((PUCHAR)MountPoint + MountPoint->SymbolicLinkNameOffset, TargetPath->Buffer, MountPoint->SymbolicLinkNameLength);
+			status = ZwDeviceIoControlFile(FileHandle, NULL, NULL, NULL, &IoStatus, IOCTL_MOUNTMGR_DELETE_POINTS, MountPoint, TargetSize, NULL, 0);
+		}
+		__free(MountPoint);
+	}
+	ZwClose(FileHandle);
+	return status;
+}
+
 NTSTATUS MountVolume(PUNICODE_STRING DeviceName, WCHAR VolumeLetter)
 {
+	BOOLEAN UseMountMgr = FALSE;
 	WCHAR SymLinkName[MAX_PATH];
 	UNICODE_STRING SymLink;
 	NTSTATUS status;
 
+	if (*NtBuildNumber > 9600)
+		UseMountMgr = TRUE;
+
 	VolumeLetter = towupper(VolumeLetter);
-	swprintf_s(SymLinkName, MAX_PATH, L"\\DosDevices\\Global\\%c:", VolumeLetter);
+	if (UseMountMgr)
+		swprintf_s(SymLinkName, MAX_PATH, L"\\DosDevices\\%c:", VolumeLetter);
+	else
+		swprintf_s(SymLinkName, MAX_PATH, L"\\DosDevices\\Global\\%c:", VolumeLetter);
 	RtlInitUnicodeString(&SymLink, SymLinkName);
-	status = IoCreateSymbolicLink(&SymLink, DeviceName);
+	if (UseMountMgr)
+		status = MountMgrMountVolume(DeviceName, &SymLink);
+	else
+		status = IoCreateSymbolicLink(&SymLink, DeviceName);
 	if (!NT_SUCCESS(status))
 	{
 		LogWarn("Failed to create symbolic link %wZ -> %wZ, error code=0x%.8X\n", DeviceName, &SymLink, status);
@@ -1327,14 +1501,24 @@ NTSTATUS MountVolume(PUNICODE_STRING DeviceName, WCHAR VolumeLetter)
 
 NTSTATUS UnmountVolume(WCHAR VolumeLetter)
 {
+	BOOLEAN UseMountMgr = FALSE;
 	WCHAR SymLinkName[MAX_PATH];
 	UNICODE_STRING SymLink;
 	NTSTATUS status;
 
+	if (*NtBuildNumber > 9600)
+		UseMountMgr = TRUE;
+
 	VolumeLetter = towupper(VolumeLetter);
-	swprintf_s(SymLinkName, MAX_PATH, L"\\DosDevices\\Global\\%c:", VolumeLetter);
+	if (UseMountMgr)
+		swprintf_s(SymLinkName, MAX_PATH, L"\\DosDevices\\%c:", VolumeLetter);
+	else
+		swprintf_s(SymLinkName, MAX_PATH, L"\\DosDevices\\Global\\%c:", VolumeLetter);
 	RtlInitUnicodeString(&SymLink, SymLinkName);
-	status = IoDeleteSymbolicLink(&SymLink);
+	if (UseMountMgr)
+		status = MountMgrUnmountVolume(&SymLink);
+	else
+		status = IoDeleteSymbolicLink(&SymLink);
 	if (!NT_SUCCESS(status))
 	{
 		LogWarn("Failed to delete symbolic link %wZ, error code=0x%.8X\n", &SymLink, status);
