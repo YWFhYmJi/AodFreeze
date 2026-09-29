@@ -32,7 +32,7 @@ NTSTATUS DPBitmap_Create(DP_BITMAP **bitmap, ULONGLONG bitMapSize, ULONG regionB
 	//检查参数，以免使用了错误的参数导致发生处零错等错误
 	if (NULL == bitmap || !regionBytes || !bitMapSize)
 	{
-		return status;
+		return STATUS_INVALID_PARAMETER;
 	}
 	__try
 	{
@@ -40,6 +40,7 @@ NTSTATUS DPBitmap_Create(DP_BITMAP **bitmap, ULONGLONG bitMapSize, ULONG regionB
 		//分配一个bitmap结构，这是无论如何都要分配的，这个结构相当于一个bitmap的handle	
 		if (NULL == (myBitmap = (DP_BITMAP *)__malloc(sizeof(DP_BITMAP))))
 		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
 			__leave;
 		}
 
@@ -65,6 +66,7 @@ NTSTATUS DPBitmap_Create(DP_BITMAP **bitmap, ULONGLONG bitMapSize, ULONG regionB
 		//分配出regionNumber那么多个指向region的指针，这是一个指针数组
 		if (NULL == (myBitmap->buffer = (UCHAR **)__malloc(sizeof(UCHAR *) * myBitmap->regionNumber)))
 		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
 			__leave;
 		}
 		//清空指针数组
@@ -212,7 +214,7 @@ NTSTATUS DPBitmap_Set(DP_BITMAP *bitMap, ULONGLONG index, BOOLEAN set)
 	if (slot >= bitMap->regionNumber)
 	{
 		LogWarn("DPBitmap_Set out of range slot %d\n", slot);
-		return STATUS_UNSUCCESSFUL;
+		return STATUS_INVALID_PARAMETER;
 	}
 
 	if (!bitMap->buffer[slot])

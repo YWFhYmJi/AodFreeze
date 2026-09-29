@@ -188,6 +188,8 @@ NTSTATUS GetVolumeInfo(ULONG DiskNum, DWORD PartitionNum, PVOLUME_INFO info)
 		{
 			info->BytesPerSector = sizeoInfo.BytesPerSector;
 			info->BytesPerCluster = sizeoInfo.BytesPerSector * sizeoInfo.SectorsPerAllocationUnit;
+			// 获取此卷上有多少个扇区, 用bytesTotal这个比较准确，如果用其它的比如fsinfo,会少几个扇区发现
+			info->SectorCount = info->BytesTotal / info->BytesPerSector;
 			info->VolumeDevice = GetVolumeDeviceByFileHandle(fileHandle);
 		}
 		else
@@ -484,20 +486,11 @@ NTSTATUS InitVolumeLogicBitmap(PVOLUME_INFO volumeInfo)
 	NTSTATUS status;
 	PVOLUME_BITMAP_BUFFER Bitmap = NULL;
 
-	// 逻辑位图大小
-	ULONGLONG logicBitMapMaxSize = 0;
-
 	ULONG SectorsPerCluster = 0;
 
 	ULONGLONG i = 0;
 
 	SectorsPerCluster = volumeInfo->BytesPerCluster / volumeInfo->BytesPerSector;
-
-	// 获取此卷上有多少个扇区, 用bytesTotal这个比较准确，如果用其它的比如fsinfo,会少几个扇区发现
-	volumeInfo->SectorCount = volumeInfo->BytesTotal / volumeInfo->BytesPerSector;
-
-	// 得到逻辑位图的大小bytes
-	logicBitMapMaxSize = (volumeInfo->SectorCount / 8) + 1;
 
 	// 上次扫描的空闲簇的位置
 	volumeInfo->LastScanIndex = volumeInfo->FirstDataSector;
@@ -631,6 +624,8 @@ NTSTATUS EnterProtectVolume(PVOLUME_INFO volumeInfo, ULONG DiskNum, ULONG Partit
 	if (NT_SUCCESS(status))
 	{
 		LogInfo("Found valid volume on disk %hu partition %hu\n", DiskNum, PartitionNum);
+		LogInfo("GetVolumeInfo StartOffset=%lld, BytesTotal=%llu, FirstDataSector=%llu, BytesPerCluster=%lu, BytesPerSector=%lu\n",
+			volumeInfo->StartOffset, volumeInfo->BytesTotal, volumeInfo->FirstDataSector, volumeInfo->BytesPerCluster, volumeInfo->BytesPerSector);
 		//初始化磁盘盘符
 		volumeInfo->Volume = GetVolumeLetter(DiskNum, PartitionNum);
 		//初始化这个卷的请求处理队列
@@ -1425,14 +1420,14 @@ ULONGLONG GetRealSectorForWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULO
 					if (!NT_SUCCESS(DPBitmap_SetRange(volumeInfo->BitmapUsed, orgIndex + 1, *nextCount, TRUE)) || 
 						!NT_SUCCESS(DPBitmap_SetRange(volumeInfo->BitmapAllow, orgIndex + 1, *nextCount, TRUE)))
 					{
-						return (ULONGLONG)-1;
+						return (ULONGLONG)-2;
 					}
 				}
 				return orgIndex;
 			}
 		}
 		// 内存不足
-		return (ULONGLONG)-1;
+		return (ULONGLONG)-2;
 	}
 
 	// 此扇区是否已经被重定向
@@ -1468,7 +1463,7 @@ ULONGLONG GetRealSectorForWrite(PVOLUME_INFO volumeInfo, ULONGLONG orgIndex, ULO
 
 			// 内存不足
 			if (!*needRedirect)
-				mapIndex = (ULONGLONG)-1;
+				mapIndex = (ULONGLONG)-2;
 		}
 	}
 
@@ -1507,11 +1502,29 @@ NTSTATUS HandleDiskRequest(
 
 	// 批量发送异步 IO，并在达到一定数量再等待，避免不必要的等待
 	#define MAX_BATCH_EVENTS 64
+	NTSTATUS batchStatus = STATUS_SUCCESS;
 	KEVENT eventBatch[MAX_BATCH_EVENTS];
+	IO_STATUS_BLOCK iosbBatch[MAX_BATCH_EVENTS];
 	PVOID eventPtrs[MAX_BATCH_EVENTS];
 	ULONG batchIndex = 0;
-	#define WAIT_BATCH { WaitForBatch(batchIndex, eventPtrs); batchIndex = 0; }
-	#define ADD_BATCH(status) if (NT_SUCCESS(status)) { eventPtrs[batchIndex] = &eventBatch[batchIndex]; batchIndex++; if (batchIndex >= MAX_BATCH_EVENTS) WAIT_BATCH }
+	#define WAIT_BATCH(batchStatus) { \
+			NTSTATUS curStatus = WaitForBatch(batchIndex, eventPtrs); \
+			if (NT_SUCCESS(curStatus)) \
+				for (ULONG _i = 0; _i < batchIndex; _i++) \
+					if (!NT_SUCCESS(iosbBatch[_i].Status)) \
+						batchStatus = iosbBatch[_i].Status; \
+			else \
+				batchStatus = curStatus; \
+			batchIndex = 0; \
+		}
+	#define ADD_BATCH(batchStatus, status) { \
+		if (NT_SUCCESS(status)) { \
+			eventPtrs[batchIndex] = &eventBatch[batchIndex]; \
+			batchIndex++; \
+			if (batchIndex >= MAX_BATCH_EVENTS) WAIT_BATCH(batchStatus) \
+		} else \
+			batchStatus = status; \
+	}
 
 	// 判断上次要处理的扇区跟这次要处理的扇区是否连续，连续了就一起处理，否则单独处理, 加快速度
 	while (length)
@@ -1527,14 +1540,14 @@ NTSTATUS HandleDiskRequest(
 			realIndex = GetRealSectorForWrite(volumeInfo, sectorIndex, length / bytesPerSector, &curCount, &needRedirect);
 		}
 
-		if (-1 == realIndex)
+		if (-1 == realIndex || (IRP_MJ_WRITE == majorFunction && -2 == realIndex))
 		{
 			InterlockedExchange8((PCHAR)&volumeInfo->CanSaveData, FALSE);
 			if (!isFirstBlock)
 			{
 				status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], majorFunction, volumeInfo->StartOffset + prevOffset,
-					prevBuffer, totalProcessBytes, FALSE, &eventBatch[batchIndex]);
-				ADD_BATCH(status);
+					prevBuffer, totalProcessBytes, FALSE, &eventBatch[batchIndex], &iosbBatch[batchIndex]);
+				ADD_BATCH(batchStatus, status);
 
 				// 判断是否要加入重定向列表
 				if (prevNeedRedirect)
@@ -1542,7 +1555,8 @@ NTSTATUS HandleDiskRequest(
 					AddRedirectRecord(volumeInfo, prevStart, prevOffset / bytesPerSector, totalProcessBytes / bytesPerSector);
 				}
 			}
-			return STATUS_DISK_FULL;
+			if (batchIndex > 0) WAIT_BATCH(batchStatus)
+			return -1 == realIndex ? STATUS_DISK_FULL : STATUS_INSUFFICIENT_RESOURCES;
 		}
 
 		physicalOffset = realIndex * bytesPerSector;
@@ -1577,8 +1591,8 @@ NTSTATUS HandleDiskRequest(
 		{
 			isFirstBlock = TRUE;
 			status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], majorFunction, volumeInfo->StartOffset + prevOffset,
-				prevBuffer, totalProcessBytes, FALSE, &eventBatch[batchIndex]);
-			ADD_BATCH(status);
+				prevBuffer, totalProcessBytes, FALSE, &eventBatch[batchIndex], &iosbBatch[batchIndex]);
+			ADD_BATCH(batchStatus, status);
 
 			// 判断是否要加入重定向列表
 			if (prevNeedRedirect)
@@ -1594,8 +1608,8 @@ NTSTATUS HandleDiskRequest(
 		if (bytesPerSector * curCount >= length)
 		{
 			status = FastFsdRequest(LowerDeviceObject[volumeInfo->DiskNumber], majorFunction, volumeInfo->StartOffset + prevOffset,
-				prevBuffer, totalProcessBytes, FALSE, &eventBatch[batchIndex]);
-			ADD_BATCH(status);
+				prevBuffer, totalProcessBytes, FALSE, &eventBatch[batchIndex], &iosbBatch[batchIndex]);
+			ADD_BATCH(batchStatus, status);
 
 			// 判断是否要加入重定向列表
 			if (prevNeedRedirect)
@@ -1612,9 +1626,18 @@ NTSTATUS HandleDiskRequest(
 		buff = (char *)buff + bytesPerSector * curCount;
 		length -= bytesPerSector * (ULONG)curCount;
 	}
-	if (batchIndex > 0) WAIT_BATCH
+	if (batchIndex > 0) WAIT_BATCH(batchStatus)
+	#undef ADD_BATCH
 	#undef WAIT_BATCH
-	return STATUS_SUCCESS;
+	if (NT_SUCCESS(batchStatus))
+		status = STATUS_SUCCESS;
+	else
+	{
+		InterlockedExchange8((PCHAR)&volumeInfo->CanSaveData, FALSE);
+		LogWarn("One or more of batches has failed with status = 0x%.8X. System will be unstable.\n", batchStatus);
+		status = STATUS_IO_DEVICE_ERROR;
+	}
+	return status;
 }
 
 // 直接写入时获取真实需要写入的备份扇区
@@ -1850,7 +1873,7 @@ NTSTATUS HandleDirectDiskRequest(
 	if (logicOffset % volumeInfo->BytesPerSector || length % volumeInfo->BytesPerSector)
 	{
 		LogWarn("Unaligned direct write to disk %lu partition %lu, offset %llu length %lu\n", volumeInfo->DiskNumber, volumeInfo->PartitionNumber, logicOffset, length);
-		return STATUS_INVALID_DEVICE_REQUEST;
+		return STATUS_INVALID_PARAMETER;
 	}
 	// 只处理对硬盘直接写的操作
 	if (IRP_MJ_WRITE == majorFunction)
@@ -2391,14 +2414,14 @@ void ThreadReadWrite(PVOID Context)
 						if (IRP_MJ_READ == io_stack->MajorFunction)
 						{
 							status = FastFsdRequest(io_stack->DeviceObject, io_stack->MajorFunction, offset.QuadPart,
-								newbuff, BufferLength, TRUE, NULL, FALSE);
+								newbuff, BufferLength, TRUE, NULL, NULL, FALSE);
 							RtlCopyMemory(buffer, newbuff, BufferLength);
 						}
 						else
 						{
 							RtlCopyMemory(newbuff, buffer, BufferLength);
 							status = FastFsdRequest(io_stack->DeviceObject, io_stack->MajorFunction, offset.QuadPart,
-								newbuff, BufferLength, TRUE, NULL, io_stack->Flags & SL_FORCE_DIRECT_WRITE);
+								newbuff, BufferLength, TRUE, NULL, NULL, io_stack->Flags & SL_FORCE_DIRECT_WRITE);
 						}
 						offset.QuadPart += BufferLength;
 						buffer = (PUCHAR)buffer + BufferLength;
@@ -2430,14 +2453,14 @@ void ThreadReadWrite(PVOID Context)
 						if (IRP_MJ_READ == io_stack->MajorFunction)
 						{
 							status = FastFsdRequest(io_stack->DeviceObject, io_stack->MajorFunction, NewOffset,
-								(PUCHAR)newbuff + BufferOffset, NewLength, TRUE, NULL, FALSE);
+								(PUCHAR)newbuff + BufferOffset, NewLength, TRUE, NULL, NULL, FALSE);
 							RtlCopyMemory((PUCHAR)buffer + BufferOffset, (PUCHAR)newbuff + BufferOffset, NewLength);
 						}
 						else
 						{
 							RtlCopyMemory((PUCHAR)newbuff + BufferOffset, (PUCHAR)buffer + BufferOffset, NewLength);
 							status = FastFsdRequest(io_stack->DeviceObject, io_stack->MajorFunction, NewOffset,
-								(PUCHAR)newbuff + BufferOffset, NewLength, TRUE, NULL, io_stack->Flags & SL_FORCE_DIRECT_WRITE);
+								(PUCHAR)newbuff + BufferOffset, NewLength, TRUE, NULL, NULL, io_stack->Flags & SL_FORCE_DIRECT_WRITE);
 						}
 					}
 				}
@@ -2624,6 +2647,7 @@ OnDiskFilterDeviceControl(
 	UNREFERENCED_PARAMETER(PartitionNumber);
 	PIO_STACK_LOCATION StackLocation = IoGetCurrentIrpStackLocation(Irp);
 	ULONG ControlCode = StackLocation->Parameters.DeviceIoControl.IoControlCode;
+	ULONG InputBufferLength = StackLocation->Parameters.DeviceIoControl.InputBufferLength;
 
 	if (!IsProtect)
 	{
@@ -2637,6 +2661,22 @@ OnDiskFilterDeviceControl(
 
 	switch (ControlCode)
 	{
+	// 特殊处理这个IOCTL，特别是TRIM命令，否则文件系统发送TRIM指令时会直接破坏保护状态
+	// TODO: 允许部分空闲扇区的TRIM
+	case IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES:
+	{
+		PDEVICE_MANAGE_DATA_SET_ATTRIBUTES dsm = (PDEVICE_MANAGE_DATA_SET_ATTRIBUTES)Irp->AssociatedIrp.SystemBuffer;
+		if (!dsm || InputBufferLength < sizeof(DEVICE_MANAGE_DATA_SET_ATTRIBUTES))
+			return FALSE;
+		if ((dsm->Action & DeviceDsmActionFlag_NonDestructive) == 0 && dsm->Action != DeviceDsmAction_None)
+		{
+			*Status = Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+			IoCompleteRequest(Irp, IO_NO_INCREMENT);
+			LogInfo("Denied destructive DSM Action 0x%.8X to %wZ on disk %d\n", dsm->Action, PhysicalDeviceName, DeviceNumber);
+			return TRUE;
+		}
+		break;
+	}
 	// 防止通过发送SCSI指令绕过还原
 	case IOCTL_SCSI_PASS_THROUGH:
 	case IOCTL_SCSI_PASS_THROUGH_DIRECT:
@@ -2660,11 +2700,11 @@ OnDiskFilterDeviceControl(
 	case IOCTL_DISK_CREATE_DISK:
 	case IOCTL_DISK_FORMAT_TRACKS:
 	case IOCTL_DISK_FORMAT_TRACKS_EX:
-	case IOCTL_DISK_VERIFY:
 	case IOCTL_DISK_REASSIGN_BLOCKS:
 	case IOCTL_DISK_REASSIGN_BLOCKS_EX:
 	case IOCTL_STORAGE_FIRMWARE_DOWNLOAD:
 	case IOCTL_STORAGE_PROTOCOL_COMMAND:
+	case IOCTL_STORAGE_REINITIALIZE_MEDIA:
 		*Status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 		LogInfo("Denied IOCTL 0x%.8X request to %wZ on disk %d\n", ControlCode, PhysicalDeviceName, DeviceNumber);

@@ -218,12 +218,12 @@ void SHA256(const PVOID lpData, SIZE_T ulSize, UCHAR lpOutput[32])
 #undef rightrotate
 #undef copy_uint32
 
-BOOL bitmap_test(ULONG *bitmap, ULONGLONG index)
+BOOLEAN bitmap_test(ULONG *bitmap, ULONGLONG index)
 {
 	return _bittest((LONG *)&bitmap[index / 8 / sizeof(ULONG)], index % (8 * sizeof(ULONG)));
 }
 
-void bitmap_set(ULONG *bitmap, ULONGLONG index, BOOL val)
+void bitmap_set(ULONG *bitmap, ULONGLONG index, BOOLEAN val)
 {
 	if (val)
 		_bittestandset((LONG*)&bitmap[index / 8 / sizeof(ULONG)], index % (8 * sizeof(ULONG)));
@@ -910,18 +910,20 @@ NTSTATUS FastFsdRequest(
 	IN ULONG Length,
 	IN BOOLEAN Wait,
 	OUT PKEVENT Event,
+	OUT PIO_STATUS_BLOCK AsyncIosb,
 	IN BOOLEAN ForceWrite
 )
 {
 	PIRP irp;
 	IO_STATUS_BLOCK iosb = { 0 };
+	PIO_STATUS_BLOCK pIosb = Wait ? &iosb : AsyncIosb;
 	KEVENT event;
 	NTSTATUS status;
 	LARGE_INTEGER byteOffset;
 
 	byteOffset.QuadPart = ByteOffset;
 	irp = IoBuildAsynchronousFsdRequest(MajorFunction, DeviceObject,
-		Buffer, Length, &byteOffset, &iosb);
+		Buffer, Length, &byteOffset, pIosb);
 	if (!irp)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -962,7 +964,10 @@ NTSTATUS FastFsdRequest(
 		{
 			irp->UserEvent = NULL;
 		}
-		irp->UserIosb = NULL; 
+		if (AsyncIosb)
+		{
+			RtlZeroMemory(AsyncIosb, sizeof(IO_STATUS_BLOCK));
+		}
 		status = IoCallDriver(DeviceObject, irp);
 	}
 
