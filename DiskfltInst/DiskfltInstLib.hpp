@@ -45,7 +45,7 @@ private:
 		}
 		return fnIsWow64Process(hProcess, Wow64Process);
 #else
-		*Wow64Process = FALSE;
+		* Wow64Process = FALSE;
 		return TRUE;
 #endif
 	}
@@ -189,20 +189,20 @@ public:
 		return dest.u;
 	}
 
-	static BOOL IsServiceRunning(WCHAR * serviceName)
+	static BOOL IsServiceRunning(LPCWSTR serviceName)
 	{
 		BOOL		ret = FALSE;
 		SC_HANDLE   scmHandle = NULL;
 		SC_HANDLE   serviceHandle = NULL;
 
-		scmHandle = OpenSCManager(NULL, NULL, GENERIC_READ);
+		scmHandle = OpenSCManagerW(NULL, NULL, GENERIC_READ);
 
 		if (NULL == scmHandle)
 		{
 			return ret;
 		}
 
-		serviceHandle = OpenService(scmHandle, serviceName, GENERIC_READ);
+		serviceHandle = OpenServiceW(scmHandle, serviceName, GENERIC_READ);
 
 		if (NULL != serviceHandle)
 		{
@@ -330,7 +330,7 @@ public:
 
 	static LPTSTR GetHashString(UCHAR Hash[32])
 	{
-		UINT *hash = (UINT*)Hash;
+		UINT* hash = (UINT*)Hash;
 		LPTSTR str = (LPTSTR)malloc(65 * sizeof(TCHAR));
 		_tsprintf_s(str, 65, _T("%.8X%.8X%.8X%.8X%.8X%.8X%.8X%.8X"), hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]);
 		return str;
@@ -361,9 +361,10 @@ public:
 
 	static BOOL Wow64FsRedirection(BOOL Enable = FALSE)
 	{
+#if defined(_WIN64) || defined(_ARM64_)
+		return TRUE;
+#else
 		static PVOID pOldVal = NULL;
-		if (Is64BitOS())
-			return TRUE;
 		if (!Enable)
 		{
 			BOOL bRet = SafeWow64DisableWow64FsRedirection(&pOldVal);
@@ -374,9 +375,10 @@ public:
 		else if (pOldVal != NULL)
 			return SafeWow64RevertWow64FsRedirection(pOldVal);
 		return FALSE;
+#endif
 	}
 
-	static BOOL EnableDebugPrivilege(TCHAR* PName, BOOL bEnable)
+	static BOOL EnableDebugPrivilege(LPCTSTR PName, BOOL bEnable)
 	{
 		BOOL              result = TRUE;
 		HANDLE            token;
@@ -453,14 +455,14 @@ public:
 		LARGE_INTEGER   AvailableAllocationUnits;
 		ULONG           SectorsPerAllocationUnit;
 		ULONG           BytesPerSector;
-	} FILE_FS_SIZE_INFORMATION, *PFILE_FS_SIZE_INFORMATION;
+	} FILE_FS_SIZE_INFORMATION, * PFILE_FS_SIZE_INFORMATION;
 
 	typedef struct _FILE_FS_ATTRIBUTE_INFORMATION {
 		ULONG FileSystemAttributes;
 		LONG  MaximumComponentNameLength;
 		ULONG FileSystemNameLength;
 		WCHAR FileSystemName[1];
-	} FILE_FS_ATTRIBUTE_INFORMATION, *PFILE_FS_ATTRIBUTE_INFORMATION;
+	} FILE_FS_ATTRIBUTE_INFORMATION, * PFILE_FS_ATTRIBUTE_INFORMATION;
 
 	static NTSTATUS GetVolumeSpace(DWORD diskNum, DWORD partNum, PULONGLONG totalSpace, PULONGLONG freeSpace, PFILE_FS_SIZE_INFORMATION fsInfo = NULL)
 	{
@@ -617,7 +619,7 @@ public:
 	{
 		STARTUPINFOW si;
 		PROCESS_INFORMATION pi;
-		WCHAR * cmdline;
+		WCHAR* cmdline;
 
 		memset(&si, 0, sizeof(si));
 		si.cb = sizeof(si);
@@ -735,7 +737,7 @@ public:
 		HKEY subKey = NULL;
 		LSTATUS result;
 		BOOL success = FALSE;
-		
+
 		if (!CreateRegKey(regKey, path, &subKey))
 			return FALSE;
 
@@ -826,7 +828,7 @@ public:
 		WCHAR ControlSetName[MAX_PATH];
 		WCHAR FilePath[MAX_PATH];
 		WCHAR TempFilePath[MAX_PATH];
-	} OFFLINE_REGISTRY, *POFFLINE_REGISTRY;
+	} OFFLINE_REGISTRY, * POFFLINE_REGISTRY;
 
 	static BOOL MountOfflineRegistry(const WCHAR* offlineDirectory, const WCHAR* regName, BOOL strict, POFFLINE_REGISTRY offlineRegistry)
 	{
@@ -1021,12 +1023,17 @@ public:
 		return needMemory;
 	}
 
-	static BOOL InstallProtectDriver(HMODULE hModule, WORD x86ResourceId, WORD x64ResourceId, LPCTSTR resourceType, const WCHAR * serviceName, const WCHAR * configPath)
+	static BOOL InstallProtectDriver(HMODULE hModule, WORD x86ResourceId, WORD x64ResourceId, LPCTSTR resourceType, const WCHAR* serviceName, const WCHAR* configPath)
 	{
 		HKEY regKey, subKey;
 		WCHAR sysDirPath[MAX_PATH];
 		WCHAR targetPath[MAX_PATH];
 		WCHAR regPath[MAX_PATH];
+		LSTATUS result;
+		WCHAR buff[1024];
+		DWORD retLen = sizeof(buff);
+		ULONG type = REG_MULTI_SZ;
+		BOOL success = TRUE;
 
 		if (!serviceName || !configPath || !GetSystemDirectoryW(sysDirPath, sizeof(sysDirPath)))
 			return FALSE;
@@ -1052,7 +1059,6 @@ public:
 		swprintf_s(regPath, L"SYSTEM\\CurrentControlSet\\Services\\%s", serviceName);
 		if (!DiskfltHelper::CreateRegKey(HKEY_LOCAL_MACHINE, regPath, &regKey))
 			goto failed;
-		BOOL success = TRUE;
 		success = success && DiskfltHelper::SetRegDword(regKey, NULL, L"Type", SERVICE_KERNEL_DRIVER);
 		success = success && DiskfltHelper::SetRegDword(regKey, NULL, L"Start", SERVICE_BOOT_START);
 		success = success && DiskfltHelper::SetRegString(regKey, NULL, L"Group", L"Boot Bus Extender");
@@ -1077,19 +1083,15 @@ public:
 		if (!DiskfltHelper::CreateRegKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E967-E325-11CE-BFC1-08002BE10318}", &regKey))
 			goto failed;
 
-		WCHAR buff[1024];
-		DWORD retLen = sizeof(buff);
-		ULONG type = REG_MULTI_SZ;
-
 		memset(buff, 0, sizeof(buff));
 		success = FALSE;
 
-		LSTATUS result = RegQueryValueExW(regKey, L"UpperFilters", 0, &type, (LPBYTE)buff, &retLen);
+		result = RegQueryValueExW(regKey, L"UpperFilters", 0, &type, (LPBYTE)buff, &retLen);
 
 		if (ERROR_SUCCESS == result && type == REG_MULTI_SZ)
 		{
 			BOOL	alreadyExists = FALSE;
-			WCHAR * ptr = NULL;
+			WCHAR* ptr = NULL;
 			for (ptr = buff; *ptr; ptr += lstrlenW(ptr) + 1)
 			{
 				if (lstrcmpiW(ptr, serviceName) == 0)
@@ -1178,13 +1180,13 @@ public:
 					RegSetValueExW(regKeyBackup, L"BootExecute", 0, REG_MULTI_SZ, (LPBYTE)buff, retLen);
 					RegFlushKey(regKeyBackup);
 				}
-				for (WCHAR * ptr = buff; *ptr && retLen > 0; )
+				for (WCHAR* ptr = buff; *ptr && retLen > 0; )
 				{
 					if (StrStrW(ptr, L"autocheck autochk"))
 					{
 						DWORD removeLength = (lstrlenW(ptr) + 1) * sizeof(WCHAR);
 						retLen -= removeLength;
-						memmove(ptr, (char *)ptr + removeLength, retLen - ((char *)ptr - (char *)buff));
+						memmove(ptr, (char*)ptr + removeLength, retLen - ((char*)ptr - (char*)buff));
 						changed = TRUE;
 					}
 					else
@@ -1257,13 +1259,13 @@ public:
 			goto cleanup;
 		}
 
-		for (WCHAR * ptr = buff; *ptr; ptr += lstrlenW(ptr) + 1)
+		for (WCHAR* ptr = buff; *ptr; ptr += lstrlenW(ptr) + 1)
 		{
 			if (lstrcmpiW(ptr, serviceName) == 0)
 			{
 				DWORD removeLength = (lstrlenW(ptr) + 1) * sizeof(WCHAR);
 				retLen -= removeLength;
-				memmove(ptr, (char *)ptr + removeLength, retLen - ((char *)ptr - (char *)buff));
+				memmove(ptr, (char*)ptr + removeLength, retLen - ((char*)ptr - (char*)buff));
 
 				result = RegSetValueExW(regKey, L"UpperFilters", 0, REG_MULTI_SZ, (LPBYTE)buff, retLen);
 				// 一定要flush,否则不保存
@@ -1371,7 +1373,7 @@ public:
 		return TRUE;
 	}
 
-	static BOOL InstallProtectionConfig(PDISKFILTER_PROTECTION_CONFIG Config, const WCHAR * ConfigPath)
+	static BOOL InstallProtectionConfig(PDISKFILTER_PROTECTION_CONFIG Config, const WCHAR* ConfigPath)
 	{
 		HANDLE hFile;
 		DWORD dwWrite;
@@ -1390,7 +1392,7 @@ public:
 		return TRUE;
 	}
 
-	static BOOL ReadProtectionConfigR3(PDISKFILTER_PROTECTION_CONFIG Config, const WCHAR * ConfigPath)
+	static BOOL ReadProtectionConfigR3(PDISKFILTER_PROTECTION_CONFIG Config, const WCHAR* ConfigPath)
 	{
 		HANDLE hFile;
 		DWORD dwRead;
@@ -1484,6 +1486,7 @@ public:
 		LARGE_INTEGER FileSize;
 		PUCHAR Buffer = NULL;
 		BOOL bRet = FALSE;
+		LONGLONG lSize;
 
 		FileHandle = CreateFile(lpFileName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 		if (FileHandle == INVALID_HANDLE_VALUE)
@@ -1492,7 +1495,7 @@ public:
 		if (!GetFileSizeEx(FileHandle, &FileSize))
 			goto out;
 
-		LONGLONG lSize = FileSize.QuadPart;
+		lSize = FileSize.QuadPart;
 		Buffer = (PUCHAR)malloc(DISKFILTER_HASH_BUFFER_SIZE + 40);
 		if (!Buffer)
 			goto out;

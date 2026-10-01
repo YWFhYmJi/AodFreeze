@@ -1995,8 +1995,6 @@ void ThreadReadWrite(PVOID Context)
 	PIRP				Irp = NULL;
 	//irp stack指针
 	PIO_STACK_LOCATION	io_stack = NULL;
-	//缓存IRP列表
-	LIST_ENTRY cacheIrpList;
 	//irp中包括的数据地址
 	PVOID				buffer = NULL;
 	//irp中的数据长度
@@ -2007,10 +2005,6 @@ void ThreadReadWrite(PVOID Context)
 	LARGE_INTEGER		cacheOffset = { 0 };
 	//是否停止保护
 	BOOLEAN				StopProtect = FALSE;
-
-	KIRQL oldIrql;
-
-	InitializeListHead(&cacheIrpList);
 
 	//设置这个线程的优先级
 	KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
@@ -2042,18 +2036,13 @@ void ThreadReadWrite(PVOID Context)
 			volume_info->CanSaveData = FALSE;
 			KeSetEvent(&volume_info->FinishSaveDataEvent, (KPRIORITY)0, FALSE);
 		}
-		// 批量取出所有待处理 IRP
-		KeAcquireSpinLock(&volume_info->ListLock, &oldIrql);
-		while (!IsListEmpty(&volume_info->ListHead))
-		{
-			PLIST_ENTRY entry = RemoveHeadList(&volume_info->ListHead);
-			InsertTailList(&cacheIrpList, entry);
-		}
-		KeReleaseSpinLock(&volume_info->ListLock, oldIrql);
-		while (!IsListEmpty(&cacheIrpList))
+		//从请求队列的首部拿出一个请求来准备处理，这里使用了自旋锁机制，所以不会有冲突
+		while ((ReqEntry = ExInterlockedRemoveHeadList(
+			&volume_info->ListHead,
+			&volume_info->ListLock
+		)) != NULL)
 		{
 			void * newbuff = NULL, *bufaddr = NULL;
-			ReqEntry = RemoveHeadList(&cacheIrpList);
 
 			//从队列的入口里找到实际的irp的地址
 			Irp = CONTAINING_RECORD(ReqEntry, IRP, Tail.Overlay.ListEntry);
@@ -2324,16 +2313,17 @@ OnDiskFilterReadWrite(
 			//我们首先把这个irp设为pending状态
 			IoMarkIrpPending(Irp);
 
-			KeAcquireSpinLock(&ProtectVolumeList[i].ListLock, &oldIrql);
-			wasEmpty = IsListEmpty(&ProtectVolumeList[i].ListHead);
-			InsertTailList(&ProtectVolumeList[i].ListHead, &Irp->Tail.Overlay.ListEntry);//然后将这个irp放进相应的请求队列里
-			KeReleaseSpinLock(&ProtectVolumeList[i].ListLock, oldIrql);
-
-			if (wasEmpty)
-			{
-				// 只在队列从空变为非空时才设置队列的等待事件，通知队列对这个irp进行处理
-				KeSetEvent(&ProtectVolumeList[i].RequestEvent, (KPRIORITY)0, FALSE);
-			}
+			//然后将这个irp放进相应的请求队列里
+			ExInterlockedInsertTailList(
+				&ProtectVolumeList[i].ListHead,
+				&Irp->Tail.Overlay.ListEntry,
+				&ProtectVolumeList[i].ListLock
+			);
+			//设置队列的等待事件，通知队列对这个irp进行处理
+			KeSetEvent(
+				&ProtectVolumeList[i].RequestEvent,
+				(KPRIORITY)0,
+				FALSE);
 
 			//返回pending状态，这个irp就算处理完了
 			*Status = STATUS_PENDING;
@@ -2390,6 +2380,7 @@ OnDiskFilterDeviceControl(
 	UNREFERENCED_PARAMETER(PartitionNumber);
 	PIO_STACK_LOCATION StackLocation = IoGetCurrentIrpStackLocation(Irp);
 	ULONG ControlCode = StackLocation->Parameters.DeviceIoControl.IoControlCode;
+	ULONG InputBufferLength = StackLocation->Parameters.DeviceIoControl.InputBufferLength;
 
 	if (!IsProtect)
 	{
@@ -2403,6 +2394,22 @@ OnDiskFilterDeviceControl(
 
 	switch (ControlCode)
 	{
+	// 特殊处理这个IOCTL，特别是TRIM命令，否则文件系统发送TRIM指令时会直接破坏保护状态
+	// TODO: 允许部分空闲扇区的TRIM
+	case IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES:
+	{
+		PDEVICE_MANAGE_DATA_SET_ATTRIBUTES dsm = (PDEVICE_MANAGE_DATA_SET_ATTRIBUTES)Irp->AssociatedIrp.SystemBuffer;
+		if (!dsm || InputBufferLength < sizeof(DEVICE_MANAGE_DATA_SET_ATTRIBUTES))
+			return FALSE;
+		if ((dsm->Action & DeviceDsmActionFlag_NonDestructive) == 0 && dsm->Action != DeviceDsmAction_None)
+		{
+			*Status = Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+			IoCompleteRequest(Irp, IO_NO_INCREMENT);
+			LogInfo("Denied destructive DSM Action 0x%.8X to %wZ on disk %d\n", dsm->Action, PhysicalDeviceName, DeviceNumber);
+			return TRUE;
+		}
+		break;
+	}
 	// 防止通过发送SCSI指令绕过还原
 	case IOCTL_SCSI_PASS_THROUGH:
 	case IOCTL_SCSI_PASS_THROUGH_DIRECT:
@@ -2426,11 +2433,11 @@ OnDiskFilterDeviceControl(
 	case IOCTL_DISK_CREATE_DISK:
 	case IOCTL_DISK_FORMAT_TRACKS:
 	case IOCTL_DISK_FORMAT_TRACKS_EX:
-	case IOCTL_DISK_VERIFY:
 	case IOCTL_DISK_REASSIGN_BLOCKS:
 	case IOCTL_DISK_REASSIGN_BLOCKS_EX:
 	case IOCTL_STORAGE_FIRMWARE_DOWNLOAD:
 	case IOCTL_STORAGE_PROTOCOL_COMMAND:
+	case IOCTL_STORAGE_REINITIALIZE_MEDIA:
 		*Status = Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 		LogInfo("Denied IOCTL 0x%.8X request to %wZ on disk %d\n", ControlCode, PhysicalDeviceName, DeviceNumber);
